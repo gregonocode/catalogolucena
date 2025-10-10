@@ -25,7 +25,9 @@ function slugify(input: string) {
 }
 
 function isPgErr(e: unknown): e is PostgrestError {
-  return typeof e === "object" && e !== null && "code" in e && typeof (e as any).code === "string";
+  if (typeof e !== "object" || e === null) return false;
+  const obj = e as Partial<PostgrestError>;
+  return typeof obj.code === "string" && typeof obj.message === "string";
 }
 
 export default function CategoriesPage() {

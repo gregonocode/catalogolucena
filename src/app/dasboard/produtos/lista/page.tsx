@@ -113,7 +113,7 @@ export default function ProductsListPage() {
       const ids = list.map((p) => p.id);
 
       // --- Imagens (não aborta em caso de erro) ---
-      let byProductImgs = new Map<string, ProductImage[]>();
+      const byProductImgs = new Map<string, ProductImage[]>();
       try {
         const { data: imgs, error: imgErr } = await supabase
           .from("product_images")
@@ -133,7 +133,7 @@ export default function ProductsListPage() {
       }
 
       // --- Categorias (não aborta em caso de erro) ---
-      let byProductCats = new Map<string, Category[]>();
+      const byProductCats = new Map<string, Category[]>();
       try {
         const { data: pc, error: pcErr } = await supabase
           .from("product_categories")

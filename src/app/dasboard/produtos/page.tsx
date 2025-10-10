@@ -76,73 +76,77 @@ export default function ProductsPage() {
     return Math.round(num * 100);
   }
 
-  async function onSubmit(e: React.FormEvent) {
-    e.preventDefault();
-    setSubmitting(true);
-    setOk(null);
-    setErr(null);
+  async function onSubmit(e: React.FormEvent<HTMLFormElement>) {
+  e.preventDefault();
+  setSubmitting(true);
+  setOk(null);
+  setErr(null);
 
-    try {
-      if (!form.title.trim()) throw new Error("Informe o nome do produto");
-      const price_cents = parseBRLToCents(form.priceBRL);
+  try {
+    if (!form.title.trim()) throw new Error("Informe o nome do produto");
+    const price_cents = parseBRLToCents(form.priceBRL);
 
-      // 1) Inserir produto
-      const { data: product, error: prodErr } = await supabase
-        .from("products")
-        .insert({
-          title: form.title.trim(),
-          description: form.description.trim() || null,
-          price_cents,
-          active: form.active,
-        })
-        .select("id")
-        .single();
-      if (prodErr) throw prodErr;
+    // 1) Inserir produto (tipando o retorno)
+    const { data: product, error: prodErr } = await supabase
+      .from("products")
+      .insert({
+        title: form.title.trim(),
+        description: form.description.trim() || null,
+        price_cents,
+        active: form.active,
+      })
+      .select("id")
+      .single<{ id: string }>();
 
-      // 2) Upload de imagem (opcional) no bucket "produtos" e criar product_images
-      if (form.imageFile) {
-        const file = form.imageFile;
-        const path = `products/${product.id}/${Date.now()}-${file.name}`;
-        const { error: upErr } = await supabase.storage
-          .from("produtos")
-          .upload(path, file, {
-            cacheControl: "3600",
-            upsert: true,
-            contentType: file.type || undefined,
-          });
-        if (upErr) throw upErr;
+    if (prodErr) throw prodErr;
 
-        const { error: imgErr } = await supabase
-          .from("product_images")
-          .insert({
-            product_id: product.id,
-            storage_path: path,
-            is_primary: true,
-          });
-        if (imgErr) throw imgErr;
-      }
+    // 2) Upload de imagem (opcional)
+    if (form.imageFile) {
+      const file = form.imageFile;
+      const path = `products/${product.id}/${Date.now()}-${file.name}`;
+      const { error: upErr } = await supabase.storage
+        .from("produtos")
+        .upload(path, file, {
+          cacheControl: "3600",
+          upsert: true,
+          contentType: file.type || undefined,
+        });
+      if (upErr) throw upErr;
 
-      // 3) Vincular categorias (se houver)
-      if (form.categoryIds.length) {
-        const payload = form.categoryIds.map((category_id) => ({
-          product_id: product.id,
-          category_id,
-        }));
-        const { error: pcErr } = await supabase
-          .from("product_categories")
-          .insert(payload);
-        if (pcErr) throw pcErr;
-      }
-
-      setOk("Produto criado com sucesso!");
-      setForm({ title: "", description: "", priceBRL: "", active: true, categoryIds: [], imageFile: null });
-    } catch (e: any) {
-      console.error(e);
-      setErr(e?.message || "Erro ao criar produto");
-    } finally {
-      setSubmitting(false);
+      const { error: imgErr } = await supabase.from("product_images").insert({
+        product_id: product.id,
+        storage_path: path,
+        is_primary: true,
+      });
+      if (imgErr) throw imgErr;
     }
+
+    // 3) Vincular categorias (se houver)
+    if (form.categoryIds.length) {
+      const payload = form.categoryIds.map((category_id) => ({
+        product_id: product.id,
+        category_id,
+      }));
+      const { error: pcErr } = await supabase.from("product_categories").insert(payload);
+      if (pcErr) throw pcErr;
+    }
+
+    setOk("Produto criado com sucesso!");
+    setForm({
+      title: "",
+      description: "",
+      priceBRL: "",
+      active: true,
+      categoryIds: [],
+      imageFile: null,
+    });
+  } catch (e: unknown) {
+    console.error(e);
+    setErr((e as Error)?.message || "Erro ao criar produto");
+  } finally {
+    setSubmitting(false);
   }
+}
 
   function onPriceChange(v: string) {
     setForm((f) => ({ ...f, priceBRL: maskBRL(v) }));

@@ -20,6 +20,13 @@ type ImageRow = { storage_path: string; is_primary: boolean | null };
 
 type VariantGroup = { id: string; name: string; position: number };
 
+type RawVariantOption = {
+  id: string;
+  name: string;
+  position: number | null;
+  variant_group_id: string;
+};
+
 type VariantOption = { id: string; name: string; position: number; group_id: string };
 
 type CartItem = { id: string; title: string; price_cents: number; imageUrl: string | null; qty: number };
@@ -29,7 +36,8 @@ function formatPrice(cents: number) {
 }
 
 export default function ProductDetailsPage() {
-  const { id } = useParams<{ id: string }>();
+  const params = useParams<{ id: string }>();
+  const id = params.id;
   const router = useRouter();
   const supabase = supabaseBrowser();
 
@@ -53,12 +61,16 @@ export default function ProductDetailsPage() {
     try {
       const raw = localStorage.getItem("cart_v1");
       if (raw) setCart(JSON.parse(raw));
-    } catch {}
+    } catch {
+      /* noop */
+    }
   }, []);
   React.useEffect(() => {
     try {
       localStorage.setItem("cart_v1", JSON.stringify(cart));
-    } catch {}
+    } catch {
+      /* noop */
+    }
   }, [cart]);
 
   function addToCart(item: Omit<CartItem, "qty">, quantity: number) {
@@ -97,10 +109,11 @@ export default function ProductDetailsPage() {
           .order("created_at", { ascending: false });
         if (ierr) throw ierr;
 
-        const urls: string[] = (irows as ImageRow[] | null)?.map((r) => {
-          const { data } = supabase.storage.from("produtos").getPublicUrl(r.storage_path);
-          return data.publicUrl;
-        }) || [];
+        const urls: string[] =
+          (irows as ImageRow[] | null)?.map((r) => {
+            const { data } = supabase.storage.from("produtos").getPublicUrl(r.storage_path);
+            return data.publicUrl;
+          }) ?? [];
 
         // 3) Variant groups
         const { data: grows, error: gerr } = await supabase
@@ -112,63 +125,58 @@ export default function ProductDetailsPage() {
 
         const vg = (grows || []) as VariantGroup[];
 
-        // 4) Tentar buscar opções em tabelas mais comuns (opcional).
-        //    Se sua tabela se chama diferente, pode ajustar abaixo.
-        const options: Record<string, VariantOption[]> = {};
+        // 4) Buscar opções (tenta 'variant_options', depois 'variant_values')
+        const optionsMap: Record<string, VariantOption[]> = {};
 
         if (vg.length > 0) {
           const groupIds = vg.map((g) => g.id);
 
+          let optRows: RawVariantOption[] | null = null;
+
           // tentar 'variant_options'
-          let optRows: any[] | null = null;
-          let optErr: any | null = null;
           try {
-            const { data, error } = await supabase
+            const { data: voData, error: voErr } = await supabase
               .from("variant_options")
               .select("id, name, position, variant_group_id")
               .in("variant_group_id", groupIds)
               .order("position", { ascending: true });
-            optRows = data as any[] | null;
-            optErr = error;
-          } catch (e) {
-            optErr = e;
-          }
-
-          // fallback: tentar 'variant_values'
-          if (optErr || !optRows) {
+            if (voErr) throw voErr;
+            optRows = (voData ?? []) as RawVariantOption[];
+          } catch {
+            // fallback: tentar 'variant_values'
             try {
-              const { data, error } = await supabase
+              const { data: vvData, error: vvErr } = await supabase
                 .from("variant_values")
                 .select("id, name, position, variant_group_id")
                 .in("variant_group_id", groupIds)
                 .order("position", { ascending: true });
-              optRows = data as any[] | null;
-              optErr = error;
-            } catch (e) {
-              // se também falhar, seguimos sem opções
+              if (vvErr) throw vvErr;
+              optRows = (vvData ?? []) as RawVariantOption[];
+            } catch {
+              optRows = null;
             }
           }
 
           if (optRows && Array.isArray(optRows)) {
             for (const r of optRows) {
-              const gid = r.variant_group_id as string;
+              const gid = r.variant_group_id;
               const entry: VariantOption = {
                 id: r.id,
                 name: r.name,
                 position: r.position ?? 0,
                 group_id: gid,
               };
-              options[gid] = [...(options[gid] || []), entry];
+              optionsMap[gid] = [...(optionsMap[gid] || []), entry];
             }
             // ordenar cada grupo por position
-            for (const gid of Object.keys(options)) {
-              options[gid].sort((a, b) => a.position - b.position);
+            for (const gid of Object.keys(optionsMap)) {
+              optionsMap[gid].sort((a, b) => a.position - b.position);
             }
           }
 
           if (!ignore) {
             setGroups(vg);
-            setOptionsByGroup(options);
+            setOptionsByGroup(optionsMap);
             // default: nenhuma selecionada
             const defaults: Record<string, string | null> = {};
             vg.forEach((g) => (defaults[g.id] = null));
@@ -181,9 +189,10 @@ export default function ProductDetailsPage() {
           setImages(urls);
           setActiveImg(0);
         }
-      } catch (e: any) {
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : "Falha ao carregar produto";
         console.error(e);
-        if (!ignore) setErr(e?.message || "Falha ao carregar produto");
+        if (!ignore) setErr(msg);
       } finally {
         if (!ignore) setLoading(false);
       }
@@ -257,8 +266,8 @@ export default function ProductDetailsPage() {
                   // eslint-disable-next-line @next/next/no-img-element
                   <img src={images[activeImg]} alt={product.title} className="w-full h-full object-cover" />
                 ) : (
-                  <div className="w-16 h-16 rounded-lg bg-gray-200" />)
-                }
+                  <div className="w-16 h-16 rounded-lg bg-gray-200" />
+                )}
               </div>
               {images.length > 1 && (
                 <div className="flex gap-2 p-2 overflow-x-auto">
@@ -269,7 +278,9 @@ export default function ProductDetailsPage() {
                       src={src}
                       alt={`Imagem ${i + 1}`}
                       onClick={() => setActiveImg(i)}
-                      className={`h-16 w-12 object-cover rounded-lg border ${i === activeImg ? "border-gray-900" : "border-gray-200"} cursor-pointer`}
+                      className={`h-16 w-12 object-cover rounded-lg border ${
+                        i === activeImg ? "border-gray-900" : "border-gray-200"
+                      } cursor-pointer`}
                     />
                   ))}
                 </div>
@@ -335,9 +346,13 @@ export default function ProductDetailsPage() {
             {/* Quantidade e CTA */}
             <div className="flex items-center gap-3">
               <div className="inline-flex items-center gap-2 border border-gray-200 rounded-xl p-1">
-                <button onClick={() => setQty((q) => Math.max(1, q - 1))} className="w-8 h-8 grid place-items-center">-</button>
+                <button onClick={() => setQty((q) => Math.max(1, q - 1))} className="w-8 h-8 grid place-items-center">
+                  -
+                </button>
                 <span className="w-8 text-center select-none">{qty}</span>
-                <button onClick={() => setQty((q) => q + 1)} className="w-8 h-8 grid place-items-center">+</button>
+                <button onClick={() => setQty((q) => q + 1)} className="w-8 h-8 grid place-items-center">
+                  +
+                </button>
               </div>
               <button
                 onClick={handleAddToCart}
@@ -358,7 +373,9 @@ export default function ProductDetailsPage() {
 
             {/* Link para início */}
             <div className="text-center pt-2">
-              <Link href="/" className="text-sm underline text-gray-600">Voltar para a loja</Link>
+              <Link href="/" className="text-sm underline text-gray-600">
+                Voltar para a loja
+              </Link>
             </div>
           </div>
         )}
@@ -371,11 +388,7 @@ function DetailsAccordion({ title, children }: { title: string; children: React.
   const [open, setOpen] = React.useState(true);
   return (
     <div className="rounded-2xl border border-gray-100">
-      <button
-        type="button"
-        onClick={() => setOpen((o) => !o)}
-        className="w-full flex items-center justify-between px-3 py-2"
-      >
+      <button type="button" onClick={() => setOpen((o) => !o)} className="w-full flex items-center justify-between px-3 py-2">
         <span className="text-sm font-medium">{title}</span>
         {open ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
       </button>

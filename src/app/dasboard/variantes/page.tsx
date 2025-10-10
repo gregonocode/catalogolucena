@@ -8,6 +8,7 @@ const ACCENT = "#01A920";
 
 type Product = { id: string; title: string };
 type VariantGroup = { id: string; product_id: string; name: string; position: number };
+type VariantGroupEditable = VariantGroup & { _editing?: boolean };
 type VariantOption = { id: string; variant_group_id: string; value: string; code: string | null; position: number };
 
 export default function VariantsPage() {
@@ -17,7 +18,7 @@ export default function VariantsPage() {
   const [productId, setProductId] = React.useState<string>("");
   const [loadingProducts, setLoadingProducts] = React.useState(true);
 
-  const [groups, setGroups] = React.useState<VariantGroup[]>([]);
+  const [groups, setGroups] = React.useState<VariantGroupEditable[]>([]);
   const [options, setOptions] = React.useState<VariantOption[]>([]);
   const [loadingData, setLoadingData] = React.useState(false);
 
@@ -28,19 +29,37 @@ export default function VariantsPage() {
   const [ok, setOk] = React.useState<string | null>(null);
 
   // helper para recarregar grupos+opções do produto atual
-  async function reloadFor(pid: string, sb = supabase, setG = setGroups, setO = setOptions, setL = setLoadingData, setE = setErr) {
-    if (!pid) { setG([]); setO([]); return; }
+  async function reloadFor(
+    pid: string,
+    sb = supabase,
+    setG: React.Dispatch<React.SetStateAction<VariantGroupEditable[]>> = setGroups,
+    setO: React.Dispatch<React.SetStateAction<VariantOption[]>> = setOptions,
+    setL: React.Dispatch<React.SetStateAction<boolean>> = setLoadingData,
+    setE: React.Dispatch<React.SetStateAction<string | null>> = setErr,
+  ) {
+    if (!pid) {
+      setG([]);
+      setO([]);
+      return;
+    }
     setL(true);
     setE(null);
+
     const { data: gdata, error: gerr } = await sb
       .from("variant_groups")
       .select("id, product_id, name, position")
       .eq("product_id", pid)
       .order("position", { ascending: true })
       .order("id", { ascending: true });
-    if (gerr) { setE(gerr.message); setL(false); return; }
 
-    const groupIds = (gdata ?? []).map(g => g.id);
+    if (gerr) {
+      setE(gerr.message);
+      setL(false);
+      return;
+    }
+
+    const groupIds = (gdata ?? []).map((g) => g.id);
+
     let odata: VariantOption[] = [];
     if (groupIds.length) {
       const { data: o, error: oerr } = await sb
@@ -49,10 +68,15 @@ export default function VariantsPage() {
         .in("variant_group_id", groupIds)
         .order("position", { ascending: true })
         .order("id", { ascending: true });
-      if (oerr) { setE(oerr.message); setL(false); return; }
+      if (oerr) {
+        setE(oerr.message);
+        setL(false);
+        return;
+      }
       odata = (o ?? []) as VariantOption[];
     }
-    setG((gdata ?? []) as VariantGroup[]);
+
+    setG((gdata ?? []) as VariantGroupEditable[]);
     setO(odata);
     setL(false);
   }
@@ -71,7 +95,7 @@ export default function VariantsPage() {
           console.error(error);
           setErr(error.message);
         } else {
-          setProducts(data ?? []);
+          setProducts((data ?? []) as Product[]);
           const first = (data && data[0]?.id) || "";
           setProductId(first);
           if (first) await reloadFor(first);
@@ -79,45 +103,47 @@ export default function VariantsPage() {
         setLoadingProducts(false);
       }
     })();
-    return () => { ignore = true; };
+    return () => {
+      ignore = true;
+    };
   }, [supabase]);
 
   // 2) Ao trocar produto, recarrega
   React.useEffect(() => {
     if (productId) reloadFor(productId);
-    else { setGroups([]); setOptions([]); }
+    else {
+      setGroups([]);
+      setOptions([]);
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [productId]);
 
   const productGroups = React.useMemo(
-    () => groups.filter(g => g.product_id === productId).sort((a,b) => a.position - b.position),
-    [groups, productId]
-  ); React.useMemo(
-    () => groups.filter(g => g.product_id === productId).sort((a,b) => a.position - b.position),
-    [groups, productId]
+    () => groups.filter((g) => g.product_id === productId).sort((a, b) => a.position - b.position),
+    [groups, productId],
   );
 
   // Criar grupo
-  async function onCreateGroup(e: React.FormEvent) {
+  async function onCreateGroup(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
     if (!groupName.trim() || !productId) return;
     setCreatingGroup(true);
-    setErr(null); setOk(null);
+    setErr(null);
+    setOk(null);
     try {
-      const nextPos = productGroups.length ? Math.max(...productGroups.map(g => g.position)) + 1 : 0;
-      const { data, error } = await supabase
+      const nextPos = productGroups.length ? Math.max(...productGroups.map((g) => g.position)) + 1 : 0;
+      const { error } = await supabase
         .from("variant_groups")
-        .insert({ product_id: productId, name: groupName.trim(), position: nextPos })
-        .select("id, product_id, name, position")
-        .single();
+        .insert({ product_id: productId, name: groupName.trim(), position: nextPos });
       if (error) throw error;
+
       // Recarrega do banco para refletir ordenação e estado real
-      await reloadFor(productId, supabase, setGroups, setOptions, setLoadingData, setErr);
-      // setGroups(prev => [...prev, data as VariantGroup]);
+      await reloadFor(productId);
       setGroupName("");
       setOk("Grupo criado");
-    } catch (e: any) {
-      setErr(e?.message || "Erro ao criar grupo");
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Erro ao criar grupo";
+      setErr(msg);
     } finally {
       setCreatingGroup(false);
     }
@@ -125,10 +151,10 @@ export default function VariantsPage() {
 
   // Editar grupo
   function startEditGroup(id: string) {
-    setGroups(prev => prev.map(g => (g.id === id ? ({ ...g, _editing: true } as any) : g)));
+    setGroups((prev) => prev.map((g) => (g.id === id ? { ...g, _editing: true } : g)));
   }
   function cancelEditGroup(id: string) {
-    setGroups(prev => prev.map(g => (g.id === id ? ({ ...g, _editing: false } as any) : g)));
+    setGroups((prev) => prev.map((g) => (g.id === id ? { ...g, _editing: false } : g)));
   }
   async function saveEditGroup(id: string, name: string) {
     try {
@@ -137,11 +163,13 @@ export default function VariantsPage() {
         .update({ name: name.trim() })
         .eq("id", id)
         .select("id, product_id, name, position")
-        .single();
+        .single<VariantGroup>();
       if (error) throw error;
-      setGroups(prev => prev.map(g => g.id === id ? ({ ...(data as VariantGroup), _editing: false } as any) : g));
-    } catch (e: any) {
-      setErr(e?.message || "Erro ao salvar grupo");
+
+      setGroups((prev) => prev.map((g) => (g.id === id ? { ...data, _editing: false } : g)));
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Erro ao salvar grupo";
+      setErr(msg);
     }
   }
 
@@ -151,10 +179,11 @@ export default function VariantsPage() {
     try {
       const { error } = await supabase.from("variant_groups").delete().eq("id", id);
       if (error) throw error;
-      setGroups(prev => prev.filter(g => g.id !== id));
+      setGroups((prev) => prev.filter((g) => g.id !== id));
       await reloadFor(productId);
-    } catch (e: any) {
-      setErr(e?.message || "Erro ao remover grupo");
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Erro ao remover grupo";
+      setErr(msg);
     }
   }
 
@@ -162,31 +191,32 @@ export default function VariantsPage() {
   async function addOption(groupId: string, value: string, code?: string) {
     if (!value.trim()) return;
     try {
-      const count = options.filter(o => o.variant_group_id === groupId).length;
-      const { data, error } = await supabase
-        .from("variant_options")
-        .insert({ variant_group_id: groupId, value: value.trim(), code: (code || null), position: count })
-        .select("id, variant_group_id, value, code, position")
-        .single();
+      const count = options.filter((o) => o.variant_group_id === groupId).length;
+      const { error } = await supabase.from("variant_options").insert({
+        variant_group_id: groupId,
+        value: value.trim(),
+        code: code || null,
+        position: count,
+      });
       if (error) throw error;
       await reloadFor(productId);
-    } catch (e: any) {
-      setErr(e?.message || "Erro ao adicionar opção");
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Erro ao adicionar opção";
+      setErr(msg);
     }
   }
 
   async function saveOption(optId: string, payload: Partial<VariantOption>) {
     try {
-      const { data, error } = await supabase
+      const { error } = await supabase
         .from("variant_options")
-        .update({ value: payload.value?.trim(), code: (payload.code ?? null) })
-        .eq("id", optId)
-        .select("id, variant_group_id, value, code, position")
-        .single();
+        .update({ value: payload.value?.trim(), code: payload.code ?? null })
+        .eq("id", optId);
       if (error) throw error;
       await reloadFor(productId);
-    } catch (e: any) {
-      setErr(e?.message || "Erro ao salvar opção");
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Erro ao salvar opção";
+      setErr(msg);
     }
   }
 
@@ -196,8 +226,9 @@ export default function VariantsPage() {
       const { error } = await supabase.from("variant_options").delete().eq("id", optId);
       if (error) throw error;
       await reloadFor(productId);
-    } catch (e: any) {
-      setErr(e?.message || "Erro ao remover opção");
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Erro ao remover opção";
+      setErr(msg);
     }
   }
 
@@ -220,8 +251,10 @@ export default function VariantsPage() {
             className="w-full px-3 py-2 rounded-xl border border-gray-200 bg-white"
             disabled={loadingProducts}
           >
-            {products.map(p => (
-              <option key={p.id} value={p.id}>{p.title}</option>
+            {products.map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.title}
+              </option>
             ))}
           </select>
           <span className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400">
@@ -259,11 +292,8 @@ export default function VariantsPage() {
       ) : (
         <div className="space-y-3">
           {productGroups.length === 0 ? (
-            <div className="p-3 rounded-xl border border-gray-100 bg-gray-50 text-sm text-gray-600">
-              Nenhum grupo criado.
-            </div>
+            <div className="p-3 rounded-xl border border-gray-100 bg-gray-50 text-sm text-gray-600">Nenhum grupo criado.</div>
           ) : null}
-          
 
           {productGroups.map((g) => (
             <section key={g.id} className="rounded-2xl border border-gray-100 bg-white shadow-sm overflow-hidden">
@@ -272,18 +302,14 @@ export default function VariantsPage() {
                   <span className="grid place-items-center w-7 h-7 rounded-md bg-gray-100 border border-gray-200">
                     <GripVertical className="w-4 h-4 text-gray-600" />
                   </span>
-                  {(g as any)._editing ? (
-                    <GroupEditInline
-                      name={g.name}
-                      onCancel={() => cancelEditGroup(g.id)}
-                      onSave={(name) => saveEditGroup(g.id, name)}
-                    />
+                  {g._editing ? (
+                    <GroupEditInline name={g.name} onCancel={() => cancelEditGroup(g.id)} onSave={(name) => saveEditGroup(g.id, name)} />
                   ) : (
                     <h2 className="text-sm font-medium">{g.name}</h2>
                   )}
                 </div>
                 <div className="flex items-center gap-1.5">
-                  {(g as any)._editing ? null : (
+                  {g._editing ? null : (
                     <button onClick={() => startEditGroup(g.id)} className="px-2 py-1 rounded-lg border border-gray-200 text-xs bg-white">
                       <Pencil className="w-4 h-4" />
                     </button>
@@ -297,7 +323,7 @@ export default function VariantsPage() {
               {/* Opções do grupo */}
               <OptionsList
                 groupId={g.id}
-                options={options.filter(o => o.variant_group_id === g.id).sort((a,b) => a.position - b.position)}
+                options={options.filter((o) => o.variant_group_id === g.id).sort((a, b) => a.position - b.position)}
                 onAdd={addOption}
                 onSave={saveOption}
                 onDelete={deleteOption}
@@ -317,7 +343,15 @@ export default function VariantsPage() {
   );
 }
 
-function GroupEditInline({ name, onCancel, onSave }: { name: string; onCancel: () => void; onSave: (name: string) => void }) {
+function GroupEditInline({
+  name,
+  onCancel,
+  onSave,
+}: {
+  name: string;
+  onCancel: () => void;
+  onSave: (name: string) => void;
+}) {
   const [v, setV] = React.useState(name);
   const [saving, setSaving] = React.useState(false);
 
@@ -344,7 +378,13 @@ function GroupEditInline({ name, onCancel, onSave }: { name: string; onCancel: (
   );
 }
 
-function OptionsList({ groupId, options, onAdd, onSave, onDelete }: {
+function OptionsList({
+  groupId,
+  options,
+  onAdd,
+  onSave,
+  onDelete,
+}: {
   groupId: string;
   options: VariantOption[];
   onAdd: (groupId: string, value: string, code?: string) => void;
@@ -371,7 +411,11 @@ function OptionsList({ groupId, options, onAdd, onSave, onDelete }: {
           className="w-40 px-3 py-2 rounded-xl border border-gray-200"
         />
         <button
-          onClick={() => { onAdd(groupId, value, code); setValue(""); setCode(""); }}
+          onClick={() => {
+            onAdd(groupId, value, code);
+            setValue("");
+            setCode("");
+          }}
           className="px-3 py-2 rounded-xl text-white text-sm"
           style={{ backgroundColor: ACCENT }}
         >
@@ -399,7 +443,13 @@ function OptionsList({ groupId, options, onAdd, onSave, onDelete }: {
   );
 }
 
-function OptionInline({ opt, onSave }: { opt: VariantOption; onSave: (optId: string, payload: Partial<VariantOption>) => void }) {
+function OptionInline({
+  opt,
+  onSave,
+}: {
+  opt: VariantOption;
+  onSave: (optId: string, payload: Partial<VariantOption>) => void;
+}) {
   const [v, setV] = React.useState(opt.value);
   const [c, setC] = React.useState(opt.code || "");
   const [saving, setSaving] = React.useState(false);

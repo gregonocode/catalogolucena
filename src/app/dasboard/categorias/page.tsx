@@ -3,6 +3,7 @@
 import React from "react";
 import { Plus, Loader2, Check, X, Edit3, Trash2, Tag } from "lucide-react";
 import { supabaseBrowser } from "@/lib/supabase-browser";
+import type { PostgrestError } from "@supabase/supabase-js";
 
 const ACCENT = "#01A920";
 
@@ -12,18 +13,25 @@ type Category = {
   slug: string;
 };
 
+type EditableCategory = Category & { _editing?: boolean };
+
 function slugify(input: string) {
   return input
     .toLowerCase()
-    .normalize("NFD").replace(/[̀-ͯ]/g, "")
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/g, "")
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/(^-|-$)+/g, "");
+}
+
+function isPgErr(e: unknown): e is PostgrestError {
+  return typeof e === "object" && e !== null && "code" in e && typeof (e as any).code === "string";
 }
 
 export default function CategoriesPage() {
   const supabase = supabaseBrowser();
 
-  const [items, setItems] = React.useState<Category[]>([]);
+  const [items, setItems] = React.useState<EditableCategory[]>([]);
   const [loading, setLoading] = React.useState(true);
 
   const [name, setName] = React.useState("");
@@ -42,17 +50,20 @@ export default function CategoriesPage() {
         .from("categories")
         .select("id, name, slug")
         .order("created_at", { ascending: false });
+
       if (!ignore) {
         if (error) {
           console.error(error);
           setErr(error.message);
         } else {
-          setItems(data ?? []);
+          setItems((data ?? []) as Category[]);
         }
         setLoading(false);
       }
     })();
-    return () => { ignore = true; };
+    return () => {
+      ignore = true;
+    };
   }, [supabase]);
 
   // Auto-slug enquanto digita o nome
@@ -83,9 +94,9 @@ export default function CategoriesPage() {
         .insert({ name: name.trim(), slug: finalSlug })
         .select("id, name, slug")
         .single();
+
       if (error) {
-        // 23505 = unique_violation
-        if ((error as any).code === "23505") {
+        if (isPgErr(error) && error.code === "23505") {
           throw new Error("Slug já existe. Escolha outro.");
         }
         throw error;
@@ -94,37 +105,41 @@ export default function CategoriesPage() {
       setItems((arr) => [data as Category, ...arr]);
       setOk("Categoria criada com sucesso!");
       resetForm();
-    } catch (e: any) {
-      setErr(e?.message || "Erro ao criar categoria");
+    } catch (e: unknown) {
+      setErr((e as Error)?.message || "Erro ao criar categoria");
     } finally {
       setSubmitting(false);
     }
   }
 
   function startEdit(id: string) {
-    setItems((arr) => arr.map((c) => (c.id === id ? { ...c, _editing: true } as any : c)));
+    setItems((arr) => arr.map((c) => (c.id === id ? { ...c, _editing: true } : c)));
   }
 
-  function cancelEdit(id: string) {
-    setItems((arr) => arr.map((c) => ({ ...(c as any), _editing: false } as any)));
+  function cancelEdit() {
+    setItems((arr) => arr.map((c) => ({ ...c, _editing: false })));
   }
 
-  async function saveEdit(id: string, name: string, slug: string) {
+  async function saveEdit(id: string, newName: string, newSlug: string) {
     try {
-      if (!name.trim() || !slug.trim()) throw new Error("Preencha os campos");
+      if (!newName.trim() || !newSlug.trim()) throw new Error("Preencha os campos");
       const { data, error } = await supabase
         .from("categories")
-        .update({ name: name.trim(), slug: slug.trim() })
+        .update({ name: newName.trim(), slug: newSlug.trim() })
         .eq("id", id)
         .select("id, name, slug")
         .single();
+
       if (error) {
-        if ((error as any).code === "23505") throw new Error("Slug já existe");
+        if (isPgErr(error) && error.code === "23505") throw new Error("Slug já existe");
         throw error;
       }
-      setItems((arr) => arr.map((c) => (c.id === id ? ({ ...(data as Category), _editing: false } as any) : c)));
-    } catch (e: any) {
-      setErr(e?.message || "Erro ao salvar");
+
+      setItems((arr) =>
+        arr.map((c) => (c.id === id ? { ...(data as Category), _editing: false } : c)),
+      );
+    } catch (e: unknown) {
+      setErr((e as Error)?.message || "Erro ao salvar");
     }
   }
 
@@ -134,8 +149,8 @@ export default function CategoriesPage() {
       const { error } = await supabase.from("categories").delete().eq("id", id);
       if (error) throw error;
       setItems((arr) => arr.filter((c) => c.id !== id));
-    } catch (e: any) {
-      setErr(e?.message || "Erro ao remover");
+    } catch (e: unknown) {
+      setErr((e as Error)?.message || "Erro ao remover");
     }
   }
 
@@ -173,7 +188,10 @@ export default function CategoriesPage() {
           </div>
           <input
             value={slug}
-            onChange={(e) => { setSlug(e.target.value); setSlugTouched(true); }}
+            onChange={(e) => {
+              setSlug(e.target.value);
+              setSlugTouched(true);
+            }}
             placeholder="ex.: vestidos"
             className="w-full px-3 py-2 rounded-xl border border-gray-200 focus:outline-none focus:ring-4"
           />
@@ -206,15 +224,17 @@ export default function CategoriesPage() {
 
       {/* Lista de categorias */}
       {loading ? (
-        <div className="p-3 rounded-xl border border-gray-100 bg-gray-50 text-sm text-gray-600">Carregando...</div>
+        <div className="p-3 rounded-xl border border-gray-100 bg-gray-50 text-sm text-gray-600">
+          Carregando...
+        </div>
       ) : (
         <ul className="space-y-2">
           {items.map((c) => (
             <li key={c.id} className="p-3 rounded-xl border border-gray-100 bg-white shadow-sm">
-              {(c as any)._editing ? (
+              {c._editing ? (
                 <EditRow
                   category={c}
-                  onCancel={() => cancelEdit(c.id)}
+                  onCancel={cancelEdit}
                   onSave={(payload) => saveEdit(c.id, payload.name, payload.slug)}
                 />
               ) : (
@@ -223,7 +243,9 @@ export default function CategoriesPage() {
             </li>
           ))}
           {items.length === 0 && (
-            <li className="p-3 rounded-xl border border-gray-100 bg-white text-sm text-gray-600">Nenhuma categoria cadastrada.</li>
+            <li className="p-3 rounded-xl border border-gray-100 bg-white text-sm text-gray-600">
+              Nenhuma categoria cadastrada.
+            </li>
           )}
         </ul>
       )}
@@ -231,7 +253,15 @@ export default function CategoriesPage() {
   );
 }
 
-function ViewRow({ category, onEdit, onDelete }: { category: Category; onEdit: () => void; onDelete: () => void }) {
+function ViewRow({
+  category,
+  onEdit,
+  onDelete,
+}: {
+  category: Category;
+  onEdit: () => void;
+  onDelete: () => void;
+}) {
   return (
     <div className="flex items-center justify-between">
       <div>
@@ -256,7 +286,15 @@ function ViewRow({ category, onEdit, onDelete }: { category: Category; onEdit: (
   );
 }
 
-function EditRow({ category, onCancel, onSave }: { category: Category; onCancel: () => void; onSave: (c: Category) => void }) {
+function EditRow({
+  category,
+  onCancel,
+  onSave,
+}: {
+  category: Category;
+  onCancel: () => void;
+  onSave: (c: Category) => void;
+}) {
   const [name, setName] = React.useState(category.name);
   const [slug, setSlug] = React.useState(category.slug);
   const [saving, setSaving] = React.useState(false);
@@ -266,8 +304,6 @@ function EditRow({ category, onCancel, onSave }: { category: Category; onCancel:
     try {
       if (!name.trim() || !slug.trim()) throw new Error("Preencha os campos");
       await onSave({ ...category, name: name.trim(), slug: slug.trim() });
-    } catch (e) {
-      // noop visual
     } finally {
       setSaving(false);
     }
@@ -295,10 +331,7 @@ function EditRow({ category, onCancel, onSave }: { category: Category; onCancel:
         >
           {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : "Salvar"}
         </button>
-        <button
-          onClick={onCancel}
-          className="px-3 py-2 rounded-xl border border-gray-200 text-xs"
-        >
+        <button onClick={onCancel} className="px-3 py-2 rounded-xl border border-gray-200 text-xs">
           Cancelar
         </button>
       </div>

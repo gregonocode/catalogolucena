@@ -3,6 +3,7 @@
 import React from "react";
 import { Loader2, Image as ImageIcon, Upload, Trash2, Check, X, RefreshCw } from "lucide-react";
 import { supabaseBrowser } from "@/lib/supabase-browser";
+import type { PostgrestError } from "@supabase/supabase-js";
 
 // Cor de destaque padrão (mantém seu padrão do projeto)
 const ACCENT = "#01A920";
@@ -14,6 +15,10 @@ type StoreSettings = {
   whatsapp_e164: string | null;
   link_banner: string | null; // novo campo na tabela store_settings
 };
+
+function isPgErr(e: unknown): e is PostgrestError {
+  return typeof e === "object" && e !== null && "message" in e && "code" in e;
+}
 
 export default function StoreConfigPage() {
   const supabase = supabaseBrowser();
@@ -31,7 +36,9 @@ export default function StoreConfigPage() {
 
   // Helpers
   function onlyDigits(s: string) {
-    return Array.from(s).filter((c) => c >= "0" && c <= "9").join("");
+    return Array.from(s)
+      .filter((c) => c >= "0" && c <= "9")
+      .join("");
   }
   function normalizeToE164BR(input: string) {
     // Aceita formatos variados e tenta normalizar para +55XXXXXXXXXXX
@@ -68,9 +75,9 @@ export default function StoreConfigPage() {
       } else {
         applySettings(data as StoreSettings);
       }
-    } catch (e: any) {
+    } catch (e: unknown) {
       console.error(e);
-      setErr(e?.message || "Falha ao carregar configurações");
+      setErr(isPgErr(e) ? e.message : (e as Error)?.message ?? "Falha ao carregar configurações");
     } finally {
       setLoading(false);
     }
@@ -96,72 +103,68 @@ export default function StoreConfigPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
- // nova verssao do hand
-async function handleSave(e: React.FormEvent) {
-  e.preventDefault();
-  setSaving(true);
-  setOk(null);
-  setErr(null);
+  // nova verssao do hand
+  async function handleSave(e: React.FormEvent) {
+    e.preventDefault();
+    setSaving(true);
+    setOk(null);
+    setErr(null);
 
-  try {
-    if (!rowId) throw new Error("Linha de configurações não encontrada");
-    if (!storeName.trim()) throw new Error("Informe o nome da loja");
+    try {
+      if (!rowId) throw new Error("Linha de configurações não encontrada");
+      if (!storeName.trim()) throw new Error("Informe o nome da loja");
 
-    const normalizedWhats = whatsE164.trim() ? normalizeToE164BR(whatsE164.trim()) : null;
+      const normalizedWhats = whatsE164.trim() ? normalizeToE164BR(whatsE164.trim()) : null;
 
-    let finalBannerUrl: string | null = bannerUrl ?? null;
+      let finalBannerUrl: string | null = bannerUrl ?? null;
 
-    // 1) Upload opcional do banner
-    if (bannerFile) {
-      const path = `store/${rowId}/${Date.now()}-${bannerFile.name}`;
-      const { error: upErr } = await supabase.storage
-        .from("banner")
-        .upload(path, bannerFile, {
+      // 1) Upload opcional do banner
+      if (bannerFile) {
+        const path = `store/${rowId}/${Date.now()}-${bannerFile.name}`;
+        const { error: upErr } = await supabase.storage.from("banner").upload(path, bannerFile, {
           cacheControl: "3600",
           upsert: true,
           contentType: bannerFile.type || undefined,
         });
-      if (upErr) throw upErr;
+        if (upErr) throw upErr;
 
-      const { data } = supabase.storage.from("banner").getPublicUrl(path);
-      finalBannerUrl = data.publicUrl;
+        const { data } = supabase.storage.from("banner").getPublicUrl(path);
+        finalBannerUrl = data.publicUrl;
+      }
+
+      // 2) UPDATE sem pedir retorno (evita o problema do .single)
+      const { error: updErr } = await supabase
+        .from("store_settings")
+        .update({
+          store_name: storeName.trim(),
+          whatsapp_e164: normalizedWhats,
+          link_banner: finalBannerUrl,
+        })
+        .eq("id", rowId);
+
+      if (updErr) throw updErr;
+
+      // 3) SELECT separado (pode usar maybeSingle para evitar o erro)
+      const { data: refreshed, error: selErr } = await supabase
+        .from("store_settings")
+        .select("id, store_name, whatsapp_e164, link_banner")
+        .eq("id", rowId)
+        .maybeSingle();
+
+      if (selErr) throw selErr;
+
+      setBannerUrl(refreshed?.link_banner ?? finalBannerUrl);
+      setStoreName(refreshed?.store_name ?? storeName);
+      setWhatsE164(refreshed?.whatsapp_e164 ?? normalizedWhats ?? "");
+      setBannerFile(null);
+      setOk("Configurações salvas com sucesso!");
+    } catch (e: unknown) {
+      console.error(e);
+      setErr(isPgErr(e) ? e.message : (e as Error)?.message ?? "Erro ao salvar configurações");
+    } finally {
+      setSaving(false);
     }
-
-    // 2) UPDATE sem pedir retorno (evita o problema do .single)
-    const { error: updErr } = await supabase
-      .from("store_settings")
-      .update({
-        store_name: storeName.trim(),
-        whatsapp_e164: normalizedWhats,
-        link_banner: finalBannerUrl,
-      })
-      .eq("id", rowId);
-
-    if (updErr) throw updErr;
-
-    // 3) SELECT separado (pode usar maybeSingle para evitar o erro)
-    const { data: refreshed, error: selErr } = await supabase
-      .from("store_settings")
-      .select("id, store_name, whatsapp_e164, link_banner")
-      .eq("id", rowId)
-      .maybeSingle();
-
-    if (selErr) throw selErr;
-
-    setBannerUrl(refreshed?.link_banner ?? finalBannerUrl);
-    setStoreName(refreshed?.store_name ?? storeName);
-    setWhatsE164(refreshed?.whatsapp_e164 ?? normalizedWhats ?? "");
-    setBannerFile(null);
-    setOk("Configurações salvas com sucesso!");
-  } catch (e: any) {
-    console.error(e);
-    setErr(e?.message || "Erro ao salvar configurações");
-  } finally {
-    setSaving(false);
   }
-}
-
-
 
   async function handleRemoveBanner() {
     if (!rowId) return;
@@ -174,9 +177,9 @@ async function handleSave(e: React.FormEvent) {
       setBannerUrl(null);
       setBannerFile(null);
       setOk("Banner removido");
-    } catch (e: any) {
+    } catch (e: unknown) {
       console.error(e);
-      setErr(e?.message || "Erro ao remover banner");
+      setErr(isPgErr(e) ? e.message : (e as Error)?.message ?? "Erro ao remover banner");
     } finally {
       setSaving(false);
     }
@@ -195,9 +198,7 @@ async function handleSave(e: React.FormEvent) {
       </div>
 
       {loading ? (
-        <div className="p-3 rounded-xl border border-gray-100 bg-gray-50 text-sm text-gray-600">
-          Carregando configurações...
-        </div>
+        <div className="p-3 rounded-xl border border-gray-100 bg-gray-50 text-sm text-gray-600">Carregando configurações...</div>
       ) : (
         <form onSubmit={handleSave} className="space-y-5">
           {/* Nome da loja */}
@@ -234,7 +235,9 @@ async function handleSave(e: React.FormEvent) {
                 <img src={bannerUrl} alt="Banner atual" className="w-full h-36 object-cover" />
               </div>
             ) : (
-              <div className="h-36 rounded-2xl bg-gray-100 border border-gray-100 grid place-items-center text-gray-500 text-sm">Sem banner</div>
+              <div className="h-36 rounded-2xl bg-gray-100 border border-gray-100 grid place-items-center text-gray-500 text-sm">
+                Sem banner
+              </div>
             )}
 
             <label className="flex items-center gap-3 p-3 rounded-xl border border-dashed border-gray-300 cursor-pointer">
@@ -305,9 +308,16 @@ async function handleSave(e: React.FormEvent) {
       <div className="mt-6 p-3 rounded-xl border border-gray-100 bg-gray-50 text-xs text-gray-600">
         <p className="mb-1 font-medium">Como funciona</p>
         <ol className="list-decimal ml-4 space-y-1">
-          <li>Esta página carrega (ou cria) uma linha em <code>store_settings</code>.</li>
-          <li>Você pode atualizar <strong>nome da loja</strong>, <strong>WhatsApp</strong> e enviar um <strong>banner</strong>.</li>
-          <li>O banner é salvo no bucket <code>banner</code> e o <code>link_banner</code> recebe a URL pública.</li>
+          <li>
+            Esta página carrega (ou cria) uma linha em <code>store_settings</code>.
+          </li>
+          <li>
+            Você pode atualizar <strong>nome da loja</strong>, <strong>WhatsApp</strong> e enviar um{" "}
+            <strong>banner</strong>.
+          </li>
+          <li>
+            O banner é salvo no bucket <code>banner</code> e o <code>link_banner</code> recebe a URL pública.
+          </li>
         </ol>
       </div>
     </div>

@@ -57,6 +57,12 @@ function writeCartLS(items: CartItem[]) {
   }
 }
 
+// Conta itens (somatório das quantidades)
+function countCartLS(): number {
+  const items = readCartLS();
+  return items.reduce((sum, it) => sum + it.qty, 0);
+}
+
 // Insere/atualiza item somando quantidades, respeitando limite (max)
 function upsertCartLS(item: Omit<CartItem, "qty">, addQty: number, max?: number): CartItem[] {
   const cart = readCartLS();
@@ -96,6 +102,19 @@ export default function ProductDetailsPage() {
 
   const [qty, setQty] = React.useState(1);
   const [adding, setAdding] = React.useState(false);
+
+  // Badge do carrinho
+  const [cartCount, setCartCount] = React.useState(0);
+  React.useEffect(() => {
+    // inicial
+    setCartCount(countCartLS());
+    // atualiza se mudar em outra aba/janela
+    function onStorage(e: StorageEvent) {
+      if (e.key === CART_KEY) setCartCount(countCartLS());
+    }
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+  }, []);
 
   // Carrega dados do produto
   React.useEffect(() => {
@@ -205,10 +224,6 @@ export default function ProductDetailsPage() {
     };
   }, [id, supabase]);
 
-  function handleSelectOption(groupId: string, optionId: string) {
-    setSelectedOptions((prev) => ({ ...prev, [groupId]: optionId }));
-  }
-
   const allGroupsSelected = React.useMemo(() => {
     if (groups.length === 0) return true;
     return groups.every((g) => {
@@ -227,7 +242,7 @@ export default function ProductDetailsPage() {
     setQty((q) => Math.min(max, q + 1));
   }
 
-  // Adicionar ao carrinho: grava direto no localStorage (mesma fonte da Home)
+  // Adicionar ao carrinho: grava direto no localStorage e atualiza badge
   function handleAddToCart() {
     if (!product) return;
     if (!product.active) return;
@@ -249,7 +264,8 @@ export default function ProductDetailsPage() {
         max
       );
       writeCartLS(updated);
-      // opcional: router.push("/") para mostrar badge atualizado imediatamente
+      setCartCount(countCartLS()); // atualiza badge
+      // opcional: router.push("/") para mostrar a Home com o badge já atualizado
     } finally {
       setAdding(false);
     }
@@ -272,10 +288,18 @@ export default function ProductDetailsPage() {
           <div className="flex-1 text-center font-semibold">Detalhes do produto</div>
           <Link
             href="/"
-            className="p-2 rounded-xl border border-gray-200 bg-white shadow-sm active:scale-[0.98]"
+            className="relative p-2 rounded-xl border border-gray-200 bg-white shadow-sm active:scale-[0.98]"
             aria-label="Ir ao início"
           >
             <ShoppingCart className="w-5 h-5" />
+            {cartCount > 0 && (
+              <span
+                className="absolute -top-1 -right-1 min-w-[18px] h-[18px] px-1 rounded-full text-[10px] grid place-items-center text-white"
+                style={{ backgroundColor: ACCENT }}
+              >
+                {cartCount}
+              </span>
+            )}
           </Link>
         </div>
       </header>

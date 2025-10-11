@@ -490,6 +490,7 @@ for (const it of cart) {
                           style={{ backgroundColor: ACCENT }}
                         >
                           <ShoppingCart className="w-4 h-4 text-white" />
+                          
                         </button>
                       )}
                     </div>

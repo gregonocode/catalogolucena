@@ -3,38 +3,80 @@
 import React from "react";
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
-import { ArrowLeft, ShoppingCart, Loader2, ChevronDown, ChevronUp } from "lucide-react";
+import { ArrowLeft, ShoppingCart, Loader2, ChevronDown, ChevronUp, AlertTriangle } from "lucide-react";
 import { supabaseBrowser } from "@/lib/supabase-browser";
 
 const ACCENT = "#01A920";
 
+/* ===================== Tipos ===================== */
 type Product = {
   id: string;
   title: string;
   description: string | null;
   price_cents: number;
   active: boolean;
+  amount: number; // estoque
 };
 
 type ImageRow = { storage_path: string; is_primary: boolean | null };
 
 type VariantGroup = { id: string; name: string; position: number };
-
 type RawVariantOption = {
   id: string;
   name: string;
   position: number | null;
   variant_group_id: string;
 };
-
 type VariantOption = { id: string; name: string; position: number; group_id: string };
 
-type CartItem = { id: string; title: string; price_cents: number; imageUrl: string | null; qty: number };
+type CartItem = { id: string; title: string; price_cents: number; imageUrl: string | null; qty: number; max?: number };
+
+/* ===================== Utils ===================== */
+const CART_KEY = "cart_v1";
 
 function formatPrice(cents: number) {
   return (cents / 100).toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
 }
 
+// Lê o carrinho do localStorage
+function readCartLS(): CartItem[] {
+  try {
+    const raw = localStorage.getItem(CART_KEY);
+    return raw ? (JSON.parse(raw) as CartItem[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+// Escreve o carrinho no localStorage
+function writeCartLS(items: CartItem[]) {
+  try {
+    localStorage.setItem(CART_KEY, JSON.stringify(items));
+  } catch {
+    /* noop */
+  }
+}
+
+// Insere/atualiza item somando quantidades, respeitando limite (max)
+function upsertCartLS(item: Omit<CartItem, "qty">, addQty: number, max?: number): CartItem[] {
+  const cart = readCartLS();
+  const idx = cart.findIndex((x) => x.id === item.id);
+
+  if (idx >= 0) {
+    const cur = cart[idx];
+    const limit = typeof max === "number" ? max : cur.max ?? undefined;
+    const nextQty = limit ? Math.min(cur.qty + addQty, limit) : cur.qty + addQty;
+    const next: CartItem = { ...cur, qty: Math.max(1, nextQty), max: limit };
+    const updated = [...cart];
+    updated[idx] = next;
+    return updated;
+  }
+
+  const firstQty = Math.max(1, typeof max === "number" ? Math.min(addQty, max) : addQty);
+  return [...cart, { ...item, qty: firstQty, max }];
+}
+
+/* ===================== Página ===================== */
 export default function ProductDetailsPage() {
   const params = useParams<{ id: string }>();
   const id = params.id;
@@ -55,52 +97,23 @@ export default function ProductDetailsPage() {
   const [qty, setQty] = React.useState(1);
   const [adding, setAdding] = React.useState(false);
 
-  // Carrinho localStorage (mesmo esquema da home)
-  const [cart, setCart] = React.useState<CartItem[]>([]);
-  React.useEffect(() => {
-    try {
-      const raw = localStorage.getItem("cart_v1");
-      if (raw) setCart(JSON.parse(raw));
-    } catch {
-      /* noop */
-    }
-  }, []);
-  React.useEffect(() => {
-    try {
-      localStorage.setItem("cart_v1", JSON.stringify(cart));
-    } catch {
-      /* noop */
-    }
-  }, [cart]);
-
-  function addToCart(item: Omit<CartItem, "qty">, quantity: number) {
-    setCart((c) => {
-      const i = c.findIndex((x) => x.id === item.id);
-      if (i >= 0) {
-        const next = [...c];
-        next[i] = { ...next[i], qty: next[i].qty + quantity };
-        return next;
-      }
-      return [...c, { ...item, qty: quantity }];
-    });
-  }
-
+  // Carrega dados do produto
   React.useEffect(() => {
     let ignore = false;
     (async () => {
       setLoading(true);
       setErr(null);
       try {
-        // 1) Produto
+        // Produto com estoque
         const { data: prow, error: perr } = await supabase
           .from("products")
-          .select("id, title, description, price_cents, active")
+          .select("id, title, description, price_cents, active, amount")
           .eq("id", id)
           .maybeSingle();
         if (perr) throw perr;
         if (!prow) throw new Error("Produto não encontrado");
 
-        // 2) Imagens (todas) - bucket 'produtos'
+        // Imagens
         const { data: irows, error: ierr } = await supabase
           .from("product_images")
           .select("storage_path, is_primary")
@@ -115,7 +128,7 @@ export default function ProductDetailsPage() {
             return data.publicUrl;
           }) ?? [];
 
-        // 3) Variant groups
+        // Variant groups
         const { data: grows, error: gerr } = await supabase
           .from("variant_groups")
           .select("id, name, position")
@@ -125,15 +138,12 @@ export default function ProductDetailsPage() {
 
         const vg = (grows || []) as VariantGroup[];
 
-        // 4) Buscar opções (tenta 'variant_options', depois 'variant_values')
+        // Opções (variant_options ou variant_values)
         const optionsMap: Record<string, VariantOption[]> = {};
-
         if (vg.length > 0) {
           const groupIds = vg.map((g) => g.id);
-
           let optRows: RawVariantOption[] | null = null;
 
-          // tentar 'variant_options'
           try {
             const { data: voData, error: voErr } = await supabase
               .from("variant_options")
@@ -143,7 +153,6 @@ export default function ProductDetailsPage() {
             if (voErr) throw voErr;
             optRows = (voData ?? []) as RawVariantOption[];
           } catch {
-            // fallback: tentar 'variant_values'
             try {
               const { data: vvData, error: vvErr } = await supabase
                 .from("variant_values")
@@ -157,30 +166,19 @@ export default function ProductDetailsPage() {
             }
           }
 
-          if (optRows && Array.isArray(optRows)) {
+          if (optRows) {
             for (const r of optRows) {
-              const gid = r.variant_group_id;
               const entry: VariantOption = {
                 id: r.id,
                 name: r.name,
                 position: r.position ?? 0,
-                group_id: gid,
+                group_id: r.variant_group_id,
               };
-              optionsMap[gid] = [...(optionsMap[gid] || []), entry];
+              optionsMap[r.variant_group_id] = [...(optionsMap[r.variant_group_id] || []), entry];
             }
-            // ordenar cada grupo por position
             for (const gid of Object.keys(optionsMap)) {
               optionsMap[gid].sort((a, b) => a.position - b.position);
             }
-          }
-
-          if (!ignore) {
-            setGroups(vg);
-            setOptionsByGroup(optionsMap);
-            // default: nenhuma selecionada
-            const defaults: Record<string, string | null> = {};
-            vg.forEach((g) => (defaults[g.id] = null));
-            setSelectedOptions(defaults);
           }
         }
 
@@ -188,6 +186,11 @@ export default function ProductDetailsPage() {
           setProduct(prow as Product);
           setImages(urls);
           setActiveImg(0);
+          setGroups(vg);
+          setOptionsByGroup(optionsMap);
+          const defaults: Record<string, string | null> = {};
+          vg.forEach((g) => (defaults[g.id] = null));
+          setSelectedOptions(defaults);
         }
       } catch (e) {
         const msg = e instanceof Error ? e.message : "Falha ao carregar produto";
@@ -206,25 +209,54 @@ export default function ProductDetailsPage() {
     setSelectedOptions((prev) => ({ ...prev, [groupId]: optionId }));
   }
 
+  const allGroupsSelected = React.useMemo(() => {
+    if (groups.length === 0) return true;
+    return groups.every((g) => {
+      const opts = optionsByGroup[g.id];
+      if (!opts || opts.length === 0) return true;
+      return Boolean(selectedOptions[g.id]);
+    });
+  }, [groups, optionsByGroup, selectedOptions]);
+
+  // Quantidade (respeita estoque)
+  function handleDec() {
+    setQty((q) => Math.max(1, q - 1));
+  }
+  function handleInc() {
+    const max = product?.amount ?? 1;
+    setQty((q) => Math.min(max, q + 1));
+  }
+
+  // Adicionar ao carrinho: grava direto no localStorage (mesma fonte da Home)
   function handleAddToCart() {
     if (!product) return;
+    if (!product.active) return;
+    if (!allGroupsSelected) return;
+
+    const max = product.amount ?? 0;
+    if (max <= 0) {
+      alert("Produto esgotado no momento.");
+      return;
+    }
+
+    const desired = Math.max(1, Math.min(qty, max));
     setAdding(true);
     try {
       const img = images[0] || null;
-      addToCart({ id: product.id, title: product.title, price_cents: product.price_cents, imageUrl: img }, qty);
+      const updated = upsertCartLS(
+        { id: product.id, title: product.title, price_cents: product.price_cents, imageUrl: img },
+        desired,
+        max
+      );
+      writeCartLS(updated);
+      // opcional: router.push("/") para mostrar badge atualizado imediatamente
     } finally {
       setAdding(false);
     }
   }
 
-  const allGroupsSelected = React.useMemo(() => {
-    if (groups.length === 0) return true; // se não há grupos, ok
-    return groups.every((g) => {
-      const opts = optionsByGroup[g.id];
-      if (!opts || opts.length === 0) return true; // sem opções cadastradas
-      return Boolean(selectedOptions[g.id]);
-    });
-  }, [groups, optionsByGroup, selectedOptions]);
+  const isOut = (product?.amount ?? 0) <= 0;
+  const isLow = !isOut && (product?.amount ?? 0) < 10;
 
   return (
     <main className="min-h-dvh bg-white text-gray-900">
@@ -293,6 +325,18 @@ export default function ProductDetailsPage() {
               <div className="text-base font-semibold whitespace-nowrap">{formatPrice(product.price_cents)}</div>
             </div>
 
+            {/* Estoque info */}
+            {isOut ? (
+              <div className="inline-flex items-center gap-2 px-2 py-1 rounded-full text-xs text-red-700 bg-red-50 border border-red-200">
+                ESGOTADO
+              </div>
+            ) : isLow ? (
+              <div className="inline-flex items-center gap-2 px-2 py-1 rounded-full text-xs text-orange-700 bg-orange-50 border border-orange-200">
+                <AlertTriangle className="w-3 h-3" />
+                Restam {product.amount} un.
+              </div>
+            ) : null}
+
             {/* Descrição colapsável */}
             <DetailsAccordion title="Descrição">
               {product.description ? (
@@ -326,7 +370,7 @@ export default function ProductDetailsPage() {
                             <button
                               key={o.id}
                               type="button"
-                              onClick={() => handleSelectOption(g.id, o.id)}
+                              onClick={() => setSelectedOptions((prev) => ({ ...prev, [g.id]: o.id }))}
                               className={`px-3 py-1.5 rounded-full border text-sm ${
                                 active ? "text-white border-transparent" : "text-gray-700 border-gray-200 bg-gray-50"
                               }`}
@@ -346,22 +390,26 @@ export default function ProductDetailsPage() {
             {/* Quantidade e CTA */}
             <div className="flex items-center gap-3">
               <div className="inline-flex items-center gap-2 border border-gray-200 rounded-xl p-1">
-                <button onClick={() => setQty((q) => Math.max(1, q - 1))} className="w-8 h-8 grid place-items-center">
+                <button onClick={handleDec} className="w-8 h-8 grid place-items-center" disabled={isOut}>
                   -
                 </button>
                 <span className="w-8 text-center select-none">{qty}</span>
-                <button onClick={() => setQty((q) => q + 1)} className="w-8 h-8 grid place-items-center">
+                <button
+                  onClick={handleInc}
+                  className="w-8 h-8 grid place-items-center"
+                  disabled={isOut || qty >= (product.amount ?? 1)}
+                >
                   +
                 </button>
               </div>
               <button
                 onClick={handleAddToCart}
-                disabled={!product.active || adding || !allGroupsSelected}
+                disabled={!product.active || adding || !allGroupsSelected || isOut}
                 className="flex-1 px-3 py-3 rounded-xl text-white disabled:opacity-50"
                 style={{ backgroundColor: ACCENT }}
               >
                 {adding ? <Loader2 className="w-4 h-4 animate-spin inline mr-2" /> : null}
-                Adicionar ao carrinho
+                {isOut ? "Esgotado" : "Adicionar ao carrinho"}
               </button>
             </div>
 
@@ -371,7 +419,6 @@ export default function ProductDetailsPage() {
               </div>
             )}
 
-            {/* Link para início */}
             <div className="text-center pt-2">
               <Link href="/" className="text-sm underline text-gray-600">
                 Voltar para a loja
@@ -384,6 +431,7 @@ export default function ProductDetailsPage() {
   );
 }
 
+/* ===================== Accordion ===================== */
 function DetailsAccordion({ title, children }: { title: string; children: React.ReactNode }) {
   const [open, setOpen] = React.useState(true);
   return (

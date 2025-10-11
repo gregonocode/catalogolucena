@@ -25,6 +25,7 @@ type Product = {
   price_cents: number;
   active: boolean;
   created_at: string;
+  amount: number; // ✅ estoque
 };
 type ProductImage = {
   id: string;
@@ -39,9 +40,10 @@ type FormState = {
   priceBRL: string;
   active: boolean;
   categoryIds: string[];
+  amount: number; // ✅ estoque
   newImageFile?: File | null;
   currentImageUrl?: string | null;
-  currentImagePath?: string | null; // para poder remover/atualizar
+  currentImagePath?: string | null;
 };
 
 export default function EditProductPage() {
@@ -62,6 +64,7 @@ export default function EditProductPage() {
     priceBRL: "",
     active: true,
     categoryIds: [],
+    amount: 0, // ✅ inicia 0 até carregar
     newImageFile: null,
     currentImageUrl: null,
     currentImagePath: null,
@@ -70,11 +73,9 @@ export default function EditProductPage() {
   const [categories, setCategories] = React.useState<Category[]>([]);
   const [loadingCats, setLoadingCats] = React.useState(true);
 
-  // helpers de preço (mesmos do cadastro)
+  // helpers de preço
   function onlyDigits(text: string) {
-    return Array.from(text)
-      .filter((ch) => ch >= "0" && ch <= "9")
-      .join("");
+    return Array.from(text).filter((ch) => ch >= "0" && ch <= "9").join("");
   }
   function maskBRL(value: string) {
     const digits = onlyDigits(value);
@@ -83,13 +84,7 @@ export default function EditProductPage() {
     return cents.toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
   }
   function parseBRLToCents(masked: string) {
-    const cleaned = masked
-      .replace("R$", "")
-      .split(" ")
-      .join("")
-      .split(".")
-      .join("")
-      .replace(",", ".");
+    const cleaned = masked.replace("R$", "").split(" ").join("").split(".").join("").replace(",", ".");
     const num = Number(cleaned || "0");
     return Math.round(num * 100);
   }
@@ -156,6 +151,7 @@ export default function EditProductPage() {
             priceBRL: maskBRL(String(p.price_cents / 100)),
             active: p.active,
             categoryIds: selectedIds,
+            amount: Number.isFinite(p.amount) ? p.amount : 0, // ✅ carrega estoque
             newImageFile: null,
             currentImageUrl,
             currentImagePath,
@@ -191,6 +187,15 @@ export default function EditProductPage() {
     }));
   }
 
+  // ✅ helpers de estoque
+  function setAmount(n: number) {
+    const clamped = Math.max(0, Math.trunc(Number.isNaN(n) ? 0 : n));
+    setForm((f) => ({ ...f, amount: clamped }));
+  }
+  function adjustAmount(delta: number) {
+    setAmount((form.amount || 0) + delta);
+  }
+
   async function handleRemoveCurrentImage() {
     if (!form.currentImagePath) return;
     if (!confirm("Remover a imagem atual?")) return;
@@ -199,20 +204,14 @@ export default function EditProductPage() {
     setOk(null);
     try {
       // remove arquivo
-      const { error: remErr } = await supabase.storage
-        .from("produtos")
-        .remove([form.currentImagePath]);
+      const { error: remErr } = await supabase.storage.from("produtos").remove([form.currentImagePath]);
       if (remErr) console.warn("Falha ao remover arquivo:", remErr.message);
 
-      // remove registro (apenas a imagem com o path)
+      // remove registro
       await supabase.from("product_images").delete().eq("storage_path", form.currentImagePath);
 
       // limpa do estado
-      setForm((f) => ({
-        ...f,
-        currentImagePath: null,
-        currentImageUrl: null,
-      }));
+      setForm((f) => ({ ...f, currentImagePath: null, currentImageUrl: null }));
       setOk("Imagem removida");
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Erro ao remover imagem";
@@ -230,9 +229,11 @@ export default function EditProductPage() {
 
     try {
       if (!form.title.trim()) throw new Error("Informe o nome do produto");
+      if (!Number.isInteger(form.amount) || form.amount < 0) throw new Error("Estoque deve ser inteiro ≥ 0");
+
       const price_cents = parseBRLToCents(form.priceBRL);
 
-      // 1) Atualiza produto
+      // 1) Atualiza produto (inclui amount ✅)
       const { error: upErr } = await supabase
         .from("products")
         .update({
@@ -240,18 +241,15 @@ export default function EditProductPage() {
           description: form.description.trim() || null,
           price_cents,
           active: form.active,
+          amount: form.amount, // ✅
         })
         .eq("id", id);
       if (upErr) throw upErr;
 
-      // 2) Atualiza vínculos de categorias (simples: apaga e insere)
-      // (se preferir delta: comparar sets; aqui fazemos reset por simplicidade)
+      // 2) Atualiza vínculos de categorias (reset simplificado)
       await supabase.from("product_categories").delete().eq("product_id", id);
       if (form.categoryIds.length) {
-        const payload = form.categoryIds.map((category_id) => ({
-          product_id: id,
-          category_id,
-        }));
+        const payload = form.categoryIds.map((category_id) => ({ product_id: id, category_id }));
         const { error: pcErr } = await supabase.from("product_categories").insert(payload);
         if (pcErr) throw pcErr;
       }
@@ -270,9 +268,7 @@ export default function EditProductPage() {
           });
         if (upImgErr) throw upImgErr;
 
-        // marca nova como primária
-        // opcionalmente poderia setar todas as outras como is_primary=false
-        // aqui garantimos um único primary por produto:
+        // garante único primary
         await supabase.from("product_images").update({ is_primary: false }).eq("product_id", id);
         const { error: insImgErr } = await supabase.from("product_images").insert({
           product_id: id,
@@ -281,31 +277,23 @@ export default function EditProductPage() {
         });
         if (insImgErr) throw insImgErr;
 
-        // remove arquivo antigo se existir (opcional)
+        // remove antiga (opcional)
         if (form.currentImagePath) {
-          const { error: remErr } = await supabase.storage
-            .from("produtos")
-            .remove([form.currentImagePath]);
-          if (remErr) {
-            // não aborta por falha de remoção de arquivo anterior
-            console.warn("Falha ao remover arquivo antigo:", remErr.message);
-          }
-          // remove registro antigo (o que tinha path atual)
+          const { error: remErr } = await supabase.storage.from("produtos").remove([form.currentImagePath]);
+          if (remErr) console.warn("Falha ao remover arquivo antigo:", remErr.message);
           await supabase.from("product_images").delete().eq("storage_path", form.currentImagePath);
         }
       }
 
       setOk("Produto atualizado com sucesso!");
-      // recarrega imagem mostrada (se mudou)
+      // se trocou a imagem, recarrega a exibida
       if (form.newImageFile) {
         const { data: imgs } = await supabase
           .from("product_images")
           .select("storage_path, is_primary")
           .eq("product_id", id);
-
         const primary =
-          (imgs ?? []).find((i) => (i as ProductImage).is_primary) ||
-          (imgs ?? [])[0];
+          (imgs ?? []).find((i) => (i as ProductImage).is_primary) || (imgs ?? [])[0];
 
         let newUrl: string | null = null;
         let newPath: string | null = null;
@@ -314,12 +302,7 @@ export default function EditProductPage() {
           const { data } = supabase.storage.from("produtos").getPublicUrl(newPath);
           newUrl = data.publicUrl ?? null;
         }
-        setForm((f) => ({
-          ...f,
-          newImageFile: null,
-          currentImageUrl: newUrl,
-          currentImagePath: newPath,
-        }));
+        setForm((f) => ({ ...f, newImageFile: null, currentImageUrl: newUrl, currentImagePath: newPath }));
       }
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Erro ao atualizar produto";
@@ -366,6 +349,7 @@ export default function EditProductPage() {
       )}
 
       <form onSubmit={onSubmit} className="space-y-4">
+        {/* Nome */}
         <div className="space-y-1">
           <label className="text-sm text-gray-700">Nome do produto</label>
           <input
@@ -376,6 +360,7 @@ export default function EditProductPage() {
           />
         </div>
 
+        {/* Descrição */}
         <div className="space-y-1">
           <label className="text-sm text-gray-700">Descrição</label>
           <textarea
@@ -386,6 +371,7 @@ export default function EditProductPage() {
           />
         </div>
 
+        {/* Preço */}
         <div className="space-y-1">
           <label className="text-sm text-gray-700">Preço</label>
           <input
@@ -398,6 +384,61 @@ export default function EditProductPage() {
           />
         </div>
 
+        {/* ✅ Estoque */}
+        <div className="space-y-1">
+          <label className="text-sm text-gray-700">Estoque (unidades)</label>
+          <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => adjustAmount(-5)}
+                className="px-2 py-1 rounded-lg border border-gray-200 text-xs bg-white"
+                title="-5"
+              >
+                −5
+              </button>
+              <button
+                type="button"
+                onClick={() => adjustAmount(-1)}
+                className="px-2 py-1 rounded-lg border border-gray-200 text-xs bg-white"
+                title="-1"
+              >
+                −1
+              </button>
+            </div>
+            <input
+              type="number"
+              inputMode="numeric"
+              min={0}
+              step={1}
+              value={Number.isNaN(form.amount) ? 0 : form.amount}
+              onChange={(e) => setAmount(Number(e.target.value))}
+              placeholder="0"
+              className="w-28 px-3 py-2 rounded-xl border border-gray-200 focus:outline-none focus:ring-4 text-center tabular-nums"
+            />
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => adjustAmount(1)}
+                className="px-2 py-1 rounded-lg border border-gray-200 text-xs bg-white"
+                title="+1"
+              >
+                +1
+              </button>
+              <button
+                type="button"
+                onClick={() => adjustAmount(5)}
+                className="px-2 py-1 rounded-lg border border-gray-200 text-xs bg-white"
+                title="+5"
+              >
+                +5
+              </button>
+            </div>
+          </div>
+          <p className="text-xs text-gray-500">Dica: use os botões para ajustar rapidamente o estoque.</p>
+        </div>
+
+        {/* Categorias */}
         <div className="space-y-1">
           <label className="text-sm text-gray-700">Categorias</label>
           <div className="flex flex-wrap gap-2">
@@ -475,6 +516,7 @@ export default function EditProductPage() {
           </div>
         </div>
 
+        {/* Status */}
         <div className="flex items-center justify-between">
           <label className="text-sm text-gray-700">Ativo</label>
           <button
@@ -492,6 +534,7 @@ export default function EditProductPage() {
           </button>
         </div>
 
+        {/* Ações */}
         <div className="flex items-center gap-2 pt-2">
           <button
             type="submit"

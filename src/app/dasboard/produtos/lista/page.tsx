@@ -26,6 +26,7 @@ type ProductRow = {
   price_cents: number;
   active: boolean;
   created_at: string;
+  amount: number; // estoque
 };
 
 type ProductImage = {
@@ -35,17 +36,9 @@ type ProductImage = {
   is_primary: boolean;
 };
 
-type ProductCategoryLink = {
-  product_id: string;
-  category_id: string;
-};
-
-type Category = { id: string; name: string };
-
 type ListItem = {
   product: ProductRow;
   imgUrl: string | null;
-  categories: Category[];
 };
 
 function errorMessage(err: unknown): string {
@@ -91,7 +84,7 @@ export default function ProductsListPage() {
       let query = supabase
         .from("products")
         .select("*", { count: "exact" })
-        .order(orderBy, { ascending });
+        .order(orderBy as string, { ascending });
 
       if (search.trim()) {
         const q = search.trim();
@@ -112,7 +105,7 @@ export default function ProductsListPage() {
 
       const ids = list.map((p) => p.id);
 
-      // --- Imagens (não aborta em caso de erro) ---
+      // Imagens (não aborta em erro)
       const byProductImgs = new Map<string, ProductImage[]>();
       try {
         const { data: imgs, error: imgErr } = await supabase
@@ -132,47 +125,7 @@ export default function ProductsListPage() {
         setWarns((w) => [...w, `product_images: ${errorMessage(e)}`]);
       }
 
-      // --- Categorias (não aborta em caso de erro) ---
-      const byProductCats = new Map<string, Category[]>();
-      try {
-        const { data: pc, error: pcErr } = await supabase
-          .from("product_categories")
-          // 🔧 sem 'id', já que a tabela não possui essa coluna
-          .select("product_id, category_id")
-          .in("product_id", ids);
-        if (pcErr) throw pcErr;
-
-        const links: ProductCategoryLink[] = Array.isArray(pc)
-          ? (pc as ProductCategoryLink[])
-          : [];
-
-        const categoryIds = Array.from(new Set(links.map((r) => r.category_id)));
-
-        let categoriesMap = new Map<string, Category>();
-        if (categoryIds.length) {
-          const { data: cats, error: catsErr } = await supabase
-            .from("categories")
-            .select("id, name")
-            .in("id", categoryIds);
-          if (catsErr) throw catsErr;
-          const catsArr: Category[] = Array.isArray(cats) ? (cats as Category[]) : [];
-          categoriesMap = new Map(catsArr.map((c) => [c.id, c]));
-        }
-
-        for (const link of links) {
-          const c = categoriesMap.get(link.category_id);
-          if (c) {
-            const bucket = byProductCats.get(link.product_id) ?? [];
-            bucket.push(c);
-            byProductCats.set(link.product_id, bucket);
-          }
-        }
-      } catch (e: unknown) {
-        console.error("Erro ao carregar categorias:", e);
-        setWarns((w) => [...w, `categorias: ${errorMessage(e)}`]);
-      }
-
-      // Monta itens com URL (pode ficar null se bucket privado/sem imagem)
+      // Monta itens (sem categorias; estoque ocupa a coluna no lugar delas)
       const items: ListItem[] = list.map((p) => {
         const imgsFor = byProductImgs.get(p.id) ?? [];
         const primary =
@@ -182,14 +135,10 @@ export default function ProductsListPage() {
         let imgUrl: string | null = null;
         if (primary?.storage_path) {
           const { data } = supabase.storage.from("produtos").getPublicUrl(primary.storage_path);
-          imgUrl = data.publicUrl ?? null; // se bucket privado, podemos trocar por signed URL
+          imgUrl = data.publicUrl ?? null;
         }
 
-        return {
-          product: p,
-          imgUrl,
-          categories: byProductCats.get(p.id) ?? [],
-        };
+        return { product: p, imgUrl };
       });
 
       setRows(items);
@@ -319,6 +268,7 @@ export default function ProductsListPage() {
           <option value="created_at">Criação</option>
           <option value="title">Nome</option>
           <option value="price_cents">Preço</option>
+          <option value="amount">Estoque</option>
           <option value="active">Status</option>
         </select>
         <button
@@ -332,11 +282,12 @@ export default function ProductsListPage() {
       </div>
 
       <div className="rounded-2xl border border-gray-100 overflow-hidden">
+        {/* ⬅️ Grid ORIGINAL, apenas trocando Categorias -> Estoque */}
         <div className="grid grid-cols-[80px_1fr_140px_140px_120px_120px] gap-0 bg-gray-50 px-3 py-2 text-xs font-medium text-gray-600">
           <div>Imagem</div>
           <div>Produto</div>
           <div>Preço</div>
-          <div>Categorias</div>
+          <div>Estoque</div> {/* antes: Categorias */}
           <div>Status</div>
           <div className="text-right pr-1">Ações</div>
         </div>
@@ -351,8 +302,14 @@ export default function ProductsListPage() {
           <ul className="divide-y divide-gray-100">
             {rows.map((it) => {
               const p = it.product;
+              const isOut = p.amount <= 0;
+              const isLow = !isOut && p.amount < 10;
+
               return (
-                <li key={p.id} className="grid grid-cols-[80px_1fr_140px_140px_120px_120px] items-center px-3 py-3 gap-2">
+                <li
+                  key={p.id}
+                  className="grid grid-cols-[80px_1fr_140px_140px_120px_120px] items-center px-3 py-3 gap-2"
+                >
                   {/* Imagem */}
                   <div className="w-[64px] h-[64px] rounded-xl bg-gray-100 border border-gray-200 overflow-hidden grid place-items-center">
                     {it.imgUrl ? (
@@ -363,27 +320,25 @@ export default function ProductsListPage() {
                     )}
                   </div>
 
-                  {/* Produto */}
+                  {/* Produto (nome em cima, data embaixo, sem amontoar) */}
                   <div className="min-w-0">
                     <div className="font-medium truncate">{p.title}</div>
-                    <div className="text-xs text-gray-500">
+                    <div className="text-xs text-gray-500 mt-0.5">
                       Criado em {new Date(p.created_at).toLocaleDateString("pt-BR")}
                     </div>
                   </div>
 
-                  {/* Preço */}
-                  <div className="text-sm">{formatBRLFromCents(p.price_cents)}</div>
+                  {/* Preço (sem quebra) */}
+                  <div className="text-sm whitespace-nowrap">{formatBRLFromCents(p.price_cents)}</div>
 
-                  {/* Categorias */}
-                  <div className="flex flex-wrap gap-1">
-                    {it.categories.length ? (
-                      it.categories.map((c) => (
-                        <span key={c.id} className="px-2 py-0.5 rounded-full border border-gray-200 bg-gray-50 text-xs">
-                          {c.name}
-                        </span>
-                      ))
+                  {/* Estoque ocupando a coluna que era de Categorias */}
+                  <div className="text-sm">
+                    {isOut ? (
+                      <span className="px-2 py-0.5 rounded-full text-red-700 bg-red-50 border border-red-200 text-xs font-medium">
+                        Esgotado
+                      </span>
                     ) : (
-                      <span className="text-xs text-gray-500">—</span>
+                      <span className={`tabular-nums ${isLow ? "text-orange-600" : "text-gray-800"}`}>{p.amount}</span>
                     )}
                   </div>
 

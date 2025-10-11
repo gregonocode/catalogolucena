@@ -15,6 +15,7 @@ type FormState = {
   active: boolean;
   categoryIds: string[];
   imageFile?: File | null;
+  amount: number; // ✅ novo campo (estoque)
 };
 
 export default function ProductsPage() {
@@ -31,6 +32,7 @@ export default function ProductsPage() {
     active: true,
     categoryIds: [],
     imageFile: null,
+    amount: 0, // ✅ inicia com 0
   });
 
   const [categories, setCategories] = React.useState<Category[]>([]);
@@ -76,77 +78,88 @@ export default function ProductsPage() {
     return Math.round(num * 100);
   }
 
-  async function onSubmit(e: React.FormEvent<HTMLFormElement>) {
-  e.preventDefault();
-  setSubmitting(true);
-  setOk(null);
-  setErr(null);
-
-  try {
-    if (!form.title.trim()) throw new Error("Informe o nome do produto");
-    const price_cents = parseBRLToCents(form.priceBRL);
-
-    // 1) Inserir produto (tipando o retorno)
-    const { data: product, error: prodErr } = await supabase
-      .from("products")
-      .insert({
-        title: form.title.trim(),
-        description: form.description.trim() || null,
-        price_cents,
-        active: form.active,
-      })
-      .select("id")
-      .single<{ id: string }>();
-
-    if (prodErr) throw prodErr;
-
-    // 2) Upload de imagem (opcional)
-    if (form.imageFile) {
-      const file = form.imageFile;
-      const path = `products/${product.id}/${Date.now()}-${file.name}`;
-      const { error: upErr } = await supabase.storage
-        .from("produtos")
-        .upload(path, file, {
-          cacheControl: "3600",
-          upsert: true,
-          contentType: file.type || undefined,
-        });
-      if (upErr) throw upErr;
-
-      const { error: imgErr } = await supabase.from("product_images").insert({
-        product_id: product.id,
-        storage_path: path,
-        is_primary: true,
-      });
-      if (imgErr) throw imgErr;
-    }
-
-    // 3) Vincular categorias (se houver)
-    if (form.categoryIds.length) {
-      const payload = form.categoryIds.map((category_id) => ({
-        product_id: product.id,
-        category_id,
-      }));
-      const { error: pcErr } = await supabase.from("product_categories").insert(payload);
-      if (pcErr) throw pcErr;
-    }
-
-    setOk("Produto criado com sucesso!");
-    setForm({
-      title: "",
-      description: "",
-      priceBRL: "",
-      active: true,
-      categoryIds: [],
-      imageFile: null,
-    });
-  } catch (e: unknown) {
-    console.error(e);
-    setErr((e as Error)?.message || "Erro ao criar produto");
-  } finally {
-    setSubmitting(false);
+  function validate(): string | null {
+    if (!form.title.trim()) return "Informe o nome do produto";
+    if (!form.priceBRL.trim()) return "Informe o preço";
+    if (!Number.isInteger(form.amount) || form.amount < 0) return "Estoque deve ser um inteiro ≥ 0";
+    return null;
   }
-}
+
+  async function onSubmit(e: React.FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    setSubmitting(true);
+    setOk(null);
+    setErr(null);
+
+    try {
+      const v = validate();
+      if (v) throw new Error(v);
+
+      const price_cents = parseBRLToCents(form.priceBRL);
+
+      // 1) Inserir produto (tipando o retorno)
+      const { data: product, error: prodErr } = await supabase
+        .from("products")
+        .insert({
+          title: form.title.trim(),
+          description: form.description.trim() || null,
+          price_cents,
+          active: form.active,
+          amount: form.amount, // ✅ grava o estoque
+        })
+        .select("id")
+        .single<{ id: string }>();
+
+      if (prodErr) throw prodErr;
+
+      // 2) Upload de imagem (opcional)
+      if (form.imageFile) {
+        const file = form.imageFile;
+        const path = `products/${product.id}/${Date.now()}-${file.name}`;
+        const { error: upErr } = await supabase.storage
+          .from("produtos")
+          .upload(path, file, {
+            cacheControl: "3600",
+            upsert: true,
+            contentType: file.type || undefined,
+          });
+        if (upErr) throw upErr;
+
+        const { error: imgErr } = await supabase.from("product_images").insert({
+          product_id: product.id,
+          storage_path: path,
+          is_primary: true,
+        });
+        if (imgErr) throw imgErr;
+      }
+
+      // 3) Vincular categorias (se houver)
+      if (form.categoryIds.length) {
+        const payload = form.categoryIds.map((category_id) => ({
+          product_id: (product as { id: string }).id,
+          category_id,
+        }));
+        const { error: pcErr } = await supabase.from("product_categories").insert(payload);
+        if (pcErr) throw pcErr;
+      }
+
+      setOk("Produto criado com sucesso!");
+      setForm({
+        title: "",
+        description: "",
+        priceBRL: "",
+        active: true,
+        categoryIds: [],
+        imageFile: null,
+        amount: 0, // ✅ reseta estoque
+      });
+    } catch (e: unknown) {
+      console.error(e);
+      setErr((e as Error)?.message || "Erro ao criar produto");
+    } finally {
+      setSubmitting(false);
+    }
+  }
 
   function onPriceChange(v: string) {
     setForm((f) => ({ ...f, priceBRL: maskBRL(v) }));
@@ -203,6 +216,25 @@ export default function ProductsPage() {
             placeholder="R$ 0,00"
             className="w-full px-3 py-2 rounded-xl border border-gray-200 focus:outline-none focus:ring-4"
           />
+        </div>
+
+        {/* ✅ Estoque (amount) */}
+        <div className="space-y-1">
+          <label className="text-sm text-gray-700">Estoque (unidades)</label>
+          <input
+            type="number"
+            inputMode="numeric"
+            min={0}
+            step={1}
+            value={Number.isNaN(form.amount) ? 0 : form.amount}
+            onChange={(e) => {
+              const n = Math.trunc(Number(e.target.value));
+              setForm((f) => ({ ...f, amount: Number.isNaN(n) ? 0 : Math.max(0, n) }));
+            }}
+            placeholder="Ex.: 25"
+            className="w-full px-3 py-2 rounded-xl border border-gray-200 focus:outline-none focus:ring-4"
+          />
+          {/* (Opcional) mensagem de ajuda/valid. inline */}
         </div>
 
         <div className="space-y-1">
@@ -297,7 +329,8 @@ export default function ProductsPage() {
       <div className="mt-6 p-3 rounded-xl border border-gray-100 bg-gray-50 text-xs text-gray-600">
         <p className="mb-1 font-medium">Próximos passos:</p>
         <ol className="list-decimal ml-4 space-y-1">
-          <li>Na home (src/app/page.tsx), listar products (ativos) e buscar imagem primária via product_images.</li>
+          <li>Na home (src/app/page.tsx), listar products (ativos), imagem primária e <b>estoque (amount)</b>.</li>
+          <li>Na lista de produtos, exibir coluna de <b>Estoque</b> junto de Imagem / Produto / Preço / Categorias / Status.</li>
           <li>Implementar edição do produto (update) e upload secundário de imagens.</li>
           <li>(Opcional) Validar tamanho/tipo da imagem antes do upload.</li>
         </ol>

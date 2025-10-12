@@ -78,11 +78,11 @@ export default function VariantsPage() {
     setO: React.Dispatch<React.SetStateAction<VariantOption[]>> = setOptions,
     setL: React.Dispatch<React.SetStateAction<boolean>> = setLoadingData,
     setE: React.Dispatch<React.SetStateAction<string | null>> = setErr
-  ) {
+  ): Promise<{ groups: VariantGroupEditable[]; options: VariantOption[] }> {
     if (!pid) {
       setG([]);
       setO([]);
-      return;
+      return { groups: [], options: [] };
     }
     setL(true);
     setE(null);
@@ -97,7 +97,7 @@ export default function VariantsPage() {
     if (gerr) {
       setE(gerr.message);
       setL(false);
-      return;
+      return { groups: [], options: [] };
     }
 
     const groupIds = (gdata ?? []).map((g) => g.id);
@@ -113,14 +113,19 @@ export default function VariantsPage() {
       if (oerr) {
         setE(oerr.message);
         setL(false);
-        return;
+        return { groups: (gdata ?? []) as VariantGroupEditable[], options: [] };
       }
       odata = (o ?? []) as VariantOption[];
     }
 
-    setG((gdata ?? []) as VariantGroupEditable[]);
-    setO(odata);
+    const gArr = (gdata ?? []) as VariantGroupEditable[];
+    const oArr = odata;
+
+    setG(gArr);
+    setO(oArr);
     setL(false);
+
+    return { groups: gArr, options: oArr };
   }
 
   React.useEffect(() => {
@@ -140,7 +145,10 @@ export default function VariantsPage() {
           setProducts(arr);
           const first = arr[0]?.id ?? "";
           setProductId(first);
-          if (first) await reloadFor(first);
+          if (first) {
+            const fresh = await reloadFor(first);
+            await loadSizeStockForProduct(first, fresh.groups, fresh.options);
+          }
         }
         setLoadingProducts(false);
       }
@@ -152,7 +160,10 @@ export default function VariantsPage() {
 
   React.useEffect(() => {
     if (productId) {
-      reloadFor(productId).then(() => loadSizeStockForProduct(productId));
+      (async () => {
+        const fresh = await reloadFor(productId);
+        await loadSizeStockForProduct(productId, fresh.groups, fresh.options);
+      })();
     } else {
       setGroups([]);
       setOptions([]);
@@ -180,7 +191,11 @@ export default function VariantsPage() {
     setSavingOne(null);
   }
 
-  async function loadSizeStockForProduct(pid: string) {
+  async function loadSizeStockForProduct(
+    pid: string,
+    groupsArg?: VariantGroupEditable[],
+    optionsArg?: VariantOption[]
+  ) {
     resetSizesUI();
     if (!pid) return;
 
@@ -190,14 +205,18 @@ export default function VariantsPage() {
     try {
       const norm = (s: string) => s.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
 
+      // use dados frescos se fornecidos; caso contrário, caia para o state
+      const gList = groupsArg ?? productGroups;
+      const oList = optionsArg ?? options;
+
       // localizar grupo "Tamanho"
-      const sizeGroup = productGroups.find((g) => norm(g.name) === "tamanho") ?? null;
+      const sizeGroup = gList.find((g) => norm(g.name) === "tamanho") ?? null;
       setSizeGroupId(sizeGroup?.id ?? null);
 
       // localizar opções P/M/G/GG
       const idMap: Record<SizeKey, string | null> = { P: null, M: null, G: null, GG: null };
       if (sizeGroup) {
-        const szOpts = options
+        const szOpts = oList
           .filter((o) => o.variant_group_id === sizeGroup.id)
           .filter((o) => SIZE_LABELS.includes(o.value as SizeKey));
         for (const key of SIZE_LABELS) {
@@ -207,7 +226,7 @@ export default function VariantsPage() {
       }
       setSizeOptionIds(idMap);
 
-      // buscar quantidades salvas em product_variants
+      // buscar quantidades salvas
       const idsToLoad = Object.values(idMap).filter(Boolean) as string[];
 
       let pvArr: { variant_option_id: string; amount: number }[] = [];
@@ -220,13 +239,13 @@ export default function VariantsPage() {
         pvArr = (pvRows ?? []) as { variant_option_id: string; amount: number }[];
       }
 
-      // Sempre marcar como selecionado se existir a option (persistência pós-refresh)
+      // chip ativo se existe option; amount visível (0 se não houver linha)
       const amt: Record<SizeKey, number> = { P: 0, M: 0, G: 0, GG: 0 };
       const sel: Record<SizeKey, boolean> = { P: false, M: false, G: false, GG: false };
       for (const key of SIZE_LABELS) {
         const vid = idMap[key];
         if (vid) {
-          sel[key] = true; // <-- selecionado se existir variant_option
+          sel[key] = true;
           const found = pvArr.find((r) => r.variant_option_id === vid);
           amt[key] = Number.isFinite(found?.amount as number) ? (found!.amount as number) : 0;
         }
@@ -253,13 +272,14 @@ export default function VariantsPage() {
       .single<VariantGroup>();
     if (error) throw error;
 
-    await reloadFor(productId);
+    const fresh = await reloadFor(productId);
     setSizeGroupId(data.id);
+    // manter estado em sincronia
+    await loadSizeStockForProduct(productId, fresh.groups, fresh.options);
     return data.id;
   }
 
   async function ensureOneSizeOption(gid: string, size: SizeKey): Promise<string> {
-    // já existe?
     const existing = options.find((o) => o.variant_group_id === gid && o.value === size);
     if (existing) return existing.id;
 
@@ -271,7 +291,8 @@ export default function VariantsPage() {
       .single<{ id: string }>();
     if (error) throw error;
 
-    await reloadFor(productId);
+    const fresh = await reloadFor(productId);
+    await loadSizeStockForProduct(productId, fresh.groups, fresh.options);
     return data.id;
   }
 
@@ -296,8 +317,10 @@ export default function VariantsPage() {
           .upsert({ product_id: productId, variant_option_id: optId, amount }, { onConflict: "product_id,variant_option_id" });
         if (upErr) throw upErr;
 
+        // atualizar estados locais (imediato)
         setSizesSelected((p) => ({ ...p, [size]: true }));
         setSizeOptionIds((p) => ({ ...p, [size]: optId }));
+
         setOk(`Tamanho ${size} criado.`);
       } else {
         // desativar: remover product_variants + variant_option
@@ -318,7 +341,11 @@ export default function VariantsPage() {
         setSizesAmount((p) => ({ ...p, [size]: 0 }));
         setSizeOptionIds((p) => ({ ...p, [size]: null }));
 
-        await reloadFor(productId);
+        // recarrega e aplica na UI usando dados frescos
+        await reloadFor(productId).then(({ groups: gArr, options: oArr }) =>
+          loadSizeStockForProduct(productId, gArr, oArr)
+        );
+
         setOk(`Tamanho ${size} removido.`);
       }
     } catch (e) {
@@ -382,8 +409,9 @@ export default function VariantsPage() {
       const { error } = await supabase.from("variant_groups").delete().eq("id", id);
       if (error) throw error;
       setGroups((prev) => prev.filter((g) => g.id !== id));
-      await reloadFor(productId);
+      const fresh = await reloadFor(productId);
       if (id === sizeGroupId) resetSizesUI();
+      await loadSizeStockForProduct(productId, fresh.groups, fresh.options);
     } catch (e) {
       setErr(e instanceof Error ? e.message : "Erro ao remover grupo");
     }
@@ -399,8 +427,10 @@ export default function VariantsPage() {
         position: count,
       });
       if (error) throw error;
-      await reloadFor(productId);
-      if (groupId === sizeGroupId) await loadSizeStockForProduct(productId);
+
+      await reloadFor(productId).then(({ groups: gArr, options: oArr }) =>
+        loadSizeStockForProduct(productId, gArr, oArr)
+      );
     } catch (e) {
       setErr(e instanceof Error ? e.message : "Erro ao adicionar opção");
     }
@@ -412,8 +442,10 @@ export default function VariantsPage() {
         .update({ value: payload.value?.trim(), code: payload.code ?? null })
         .eq("id", optId);
       if (error) throw error;
-      await reloadFor(productId);
-      await loadSizeStockForProduct(productId);
+
+      await reloadFor(productId).then(({ groups: gArr, options: oArr }) =>
+        loadSizeStockForProduct(productId, gArr, oArr)
+      );
     } catch (e) {
       setErr(e instanceof Error ? e.message : "Erro ao salvar opção");
     }
@@ -423,8 +455,10 @@ export default function VariantsPage() {
     try {
       const { error } = await supabase.from("variant_options").delete().eq("id", optId);
       if (error) throw error;
-      await reloadFor(productId);
-      await loadSizeStockForProduct(productId);
+
+      await reloadFor(productId).then(({ groups: gArr, options: oArr }) =>
+        loadSizeStockForProduct(productId, gArr, oArr)
+      );
     } catch (e) {
       setErr(e instanceof Error ? e.message : "Erro ao remover opção");
     }

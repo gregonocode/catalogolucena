@@ -150,11 +150,17 @@ export default function Page() {
     return `#${String(id).padStart(5, "0")}`;
   }
 
-  // Carrinho com respeito ao estoque (variante ou produto)
+  // Carrinho: agora só permite adicionar se o estoque for CONHECIDO e > 0
   function addToCart(p: ProductCard) {
     const sizes = sizesByProduct[p.id] ?? [];
-    // Se tem variações, exigir seleção
+    const variantsKnown = variantKnownByProduct[p.id] ?? false;
+
+    // Se tem variações, exigir seleção e estoque conhecido > 0 da opção
     if (sizes.length > 0) {
+      if (!variantsKnown) {
+        alert("Estoque deste produto não está disponível no momento.");
+        return;
+      }
       const sel = selectedSize[p.id] ?? null;
       if (!sel) {
         alert("Escolha um tamanho antes de adicionar.");
@@ -165,23 +171,20 @@ export default function Page() {
         alert("Tamanho indisponível para este produto.");
         return;
       }
-
-      // Se estoque por variante é conhecido E a variante está zerada, bloqueia.
-      const variantKnown = Boolean(variantKnownByProduct[p.id]);
-      if (variantKnown && entry.amount <= 0) {
+      if (entry.amount <= 0) {
         alert("Este tamanho está esgotado.");
         return;
       }
 
       const itemId = `${p.id}:${entry.optionId}`;
-      const max = variantKnown ? entry.amount : undefined;
+      const max = entry.amount;
 
       setCart((c) => {
         const i = c.findIndex((x) => x.id === itemId);
         if (i >= 0) {
           const next = [...c];
           const currentQty = next[i].qty;
-          const nextQty = typeof max === "number" ? Math.min(currentQty + 1, max) : currentQty + 1;
+          const nextQty = Math.min(currentQty + 1, max);
           next[i] = { ...next[i], qty: nextQty, max } as CartItem;
           return next;
         }
@@ -195,24 +198,27 @@ export default function Page() {
           price_cents: p.price_cents,
           imageUrl: p.imageUrl,
           qty: 1,
-          ...(typeof max === "number" ? { max } : {}),
+          max,
         };
         return [...c, newItem];
       });
       return;
     }
 
-    // Sem variações: só bloqueia se o estoque base é conhecido e zero
-    if (p.baseKnown && p.baseAmount <= 0) return;
+    // Sem variações: só permite se o estoque base for conhecido e > 0
+    if (!p.baseKnown || p.baseAmount <= 0) {
+      alert("Produto esgotado no momento.");
+      return;
+    }
 
     setCart((c) => {
       const i = c.findIndex((x) => x.id === p.id);
-      const max = p.baseKnown ? p.baseAmount : undefined;
+      const max = p.baseAmount;
 
       if (i >= 0) {
         const next = [...c];
         const currentQty = next[i].qty;
-        const nextQty = typeof max === "number" ? Math.min(currentQty + 1, max) : currentQty + 1;
+        const nextQty = Math.min(currentQty + 1, max);
         next[i] = { ...next[i], qty: nextQty, max } as CartItem;
         return next;
       }
@@ -224,7 +230,7 @@ export default function Page() {
         price_cents: p.price_cents,
         imageUrl: p.imageUrl,
         qty: 1,
-        ...(typeof max === "number" ? { max } : {}),
+        max,
       };
       return [...c, newItem];
     });
@@ -236,20 +242,20 @@ export default function Page() {
         if (it.id !== itemId) return it;
 
         if (it.kind === "variant") {
-          // Se conhecemos o estoque da variante, clamp; se não, libera
           const list = sizesByProduct[it.product_id] ?? [];
           const currentVar = list.find((s) => s.optionId === it.variant_option_id);
           const varKnown = Boolean(variantKnownByProduct[it.product_id]);
-          const max = varKnown ? (currentVar?.amount ?? it.max ?? it.qty) : undefined;
-          const nextQty = typeof max === "number" ? Math.min(it.qty + 1, max) : it.qty + 1;
-          return { ...it, qty: nextQty, ...(typeof max === "number" ? { max } : {}) } as CartItemVariant;
+          if (!varKnown) return it; // não incrementa se não souber estoque
+          const max = currentVar?.amount ?? it.max ?? it.qty;
+          const nextQty = Math.min(it.qty + 1, max);
+          return { ...it, qty: nextQty, max } as CartItemVariant;
         }
 
-        // Simple: clamp apenas se baseKnown
         const prod = products.find((p) => p.id === it.product_id);
-        const max = prod?.baseKnown ? prod.baseAmount : undefined;
-        const nextQty = typeof max === "number" ? Math.min(it.qty + 1, max) : it.qty + 1;
-        return { ...it, qty: nextQty, ...(typeof max === "number" ? { max } : {}) } as CartItemSimple;
+        if (!prod?.baseKnown) return it; // não incrementa se não souber estoque
+        const max = prod.baseAmount;
+        const nextQty = Math.min(it.qty + 1, max);
+        return { ...it, qty: nextQty, max } as CartItemSimple;
       })
     );
   }
@@ -427,7 +433,6 @@ export default function Page() {
           arr.push({ key: sizeKey, optionId: o.id, amount });
           sizesMap[pId] = arr;
 
-          // só somamos para total quando variantes são conhecidas
           if (productsWithKnownVariants.has(pId)) {
             totals[pId] = (totals[pId] ?? 0) + amount;
           }
@@ -435,39 +440,36 @@ export default function Page() {
 
         setSizesByProduct(sizesMap);
 
-        // flags de conhecimento por produto
         const knownRecord: Record<string, boolean> = {};
         for (const pid of productIds) {
           knownRecord[pid] = productsWithKnownVariants.has(pid);
         }
         setVariantKnownByProduct(knownRecord);
 
-        // Atualiza products com totalKnown/totalAmount corretos
         setProducts((prev) =>
           prev.map((p) => {
             const variantsKnown = knownRecord[p.id] ?? false;
             if (variantsKnown) {
               return { ...p, totalAmount: totals[p.id] ?? 0, totalKnown: true };
             }
-            // Se não conhecemos variantes, mantemos base como fallback, mas totalKnown = baseKnown
-            return { ...p, totalAmount: p.baseAmount, totalKnown: p.baseKnown };
+            // Sem conhecimento de variantes => totalKnown = false (não vendemos)
+            return { ...p, totalAmount: 0, totalKnown: false };
           })
         );
 
-        // pré-seleção: se só há um tamanho com estoque > 0 e variantes são conhecidas, seleciona
+        // pré-seleção: apenas quando variantes são conhecidas
         setSelectedSize((prevSel) => {
           const next = { ...prevSel };
           for (const p of baseMapped) {
-            const entries = sizesMap[p.id] ?? [];
-            if ((knownRecord[p.id] ?? false) === true) {
+            if (knownRecord[p.id]) {
+              const entries = sizesMap[p.id] ?? [];
               const withStock = entries.filter((e) => e.amount > 0);
               if (!next[p.id]) {
                 if (withStock.length === 1) next[p.id] = withStock[0].key;
                 else next[p.id] = null;
               }
             } else {
-              // variantes desconhecidas: não pré-seleciona
-              if (typeof next[p.id] === "undefined") next[p.id] = null;
+              next[p.id] = null;
             }
           }
           return next;
@@ -494,7 +496,7 @@ export default function Page() {
     return products.filter((p) => p.categoryIds.includes(activeCat));
   }, [products, activeCat]);
 
-  // ====== Checkout: cria pedido pendente + redireciona ======
+  // ====== Checkout ======
   function buildWhatsappText(orderId: number): string {
     const lines: string[] = [];
     lines.push(`Olá! Quero finalizar o pedido *${orderCode(orderId)}* na *${storeName}*.`);
@@ -532,7 +534,6 @@ export default function Page() {
           quantity: it.qty,
           price_cents: it.price_cents,
         };
-        // sem variante
       }
       return {
         order_id: order.id,
@@ -550,12 +551,11 @@ export default function Page() {
   async function handleCheckout() {
     if (cart.length === 0 || submitting) return;
 
-    // separa itens com/sem variante
+    // Segurança extra: validar no BD
     const withVariant = cart.filter((c): c is CartItemVariant => c.kind === "variant");
     const noVariant = cart.filter((c): c is CartItemSimple => c.kind === "simple");
 
-    // valida VARIANTES via product_variants
-    let stockMapVariant = new Map<string, number>();
+    // VARIANTES
     if (withVariant.length) {
       const variantIds = withVariant.map((c) => c.variant_option_id);
       type FreshPV = { variant_option_id: string; amount: number };
@@ -567,33 +567,9 @@ export default function Page() {
         alert("Erro ao validar estoque. Tente novamente.");
         return;
       }
-      stockMapVariant = new Map<string, number>(
-        ((fresh ?? []) as FreshPV[]).map((r) => [r.variant_option_id, r.amount])
-      );
-    }
-
-    // valida ITENS SEM VARIANTE via products.amount
-    let stockMapProduct = new Map<string, number>();
-    if (noVariant.length) {
-      const prodIds = noVariant.map((c) => c.product_id);
-      type FreshProd = { id: string; amount: number };
-      const { data: freshP, error: freshPErr } = await supabase
-        .from("products")
-        .select("id, amount")
-        .in("id", prodIds);
-      if (freshPErr) {
-        alert("Erro ao validar estoque. Tente novamente.");
-        return;
-      }
-      stockMapProduct = new Map<string, number>(
-        ((freshP ?? []) as FreshProd[]).map((r) => [r.id, r.amount])
-      );
-    }
-
-    // checagem final (bloqueia somente se BD disser que não tem)
-    for (const it of cart) {
-      if (it.kind === "variant") {
-        const available = stockMapVariant.get(it.variant_option_id) ?? 0;
+      const stockMap = new Map<string, number>(((fresh ?? []) as FreshPV[]).map((r) => [r.variant_option_id, r.amount]));
+      for (const it of withVariant) {
+        const available = stockMap.get(it.variant_option_id) ?? 0;
         if (available <= 0) {
           alert(`"${it.title}" (${it.size}) está esgotado. Remova do carrinho para continuar.`);
           return;
@@ -602,13 +578,30 @@ export default function Page() {
           alert(`Quantidade de "${it.title}" excede o estoque da variante (${available}). Ajuste o carrinho.`);
           return;
         }
-      } else {
-        const available = stockMapProduct.get(it.product_id) ?? 0;
-        if (available <= 0) {
+      }
+    }
+
+    // SIMPLES (sem variação)
+    if (noVariant.length) {
+      const prodIds = noVariant.map((c) => c.product_id);
+      type FreshProd = { id: string; amount: number | null };
+      const { data: freshP, error: freshPErr } = await supabase
+        .from("products")
+        .select("id, amount")
+        .in("id", prodIds);
+      if (freshPErr) {
+        alert("Erro ao validar estoque. Tente novamente.");
+        return;
+      }
+      const stockMap = new Map<string, number | null>(((freshP ?? []) as FreshProd[]).map((r) => [r.id, r.amount]));
+      for (const it of noVariant) {
+        const available = stockMap.get(it.product_id);
+        // Se o estoque base estiver null (desconhecido) ou <= 0, bloqueia
+        if (available === null || (available ?? 0) <= 0) {
           alert(`"${it.title}" está esgotado. Remova do carrinho para continuar.`);
           return;
         }
-        if (it.qty > available) {
+        if (it.qty > (available ?? 0)) {
           alert(`Quantidade de "${it.title}" excede o estoque (${available}). Ajuste o carrinho.`);
           return;
         }
@@ -738,8 +731,10 @@ export default function Page() {
             {filtered.map((p) => {
               const sizes = sizesByProduct[p.id] ?? [];
               const hasVariants = sizes.length > 0;
-              const stockKnown = hasVariants ? (variantKnownByProduct[p.id] ?? false) : p.baseKnown;
+              const variantsKnown = variantKnownByProduct[p.id] ?? false;
 
+              // Produto "vendável" somente quando o estoque é conhecido
+              const stockKnown = hasVariants ? variantsKnown : p.baseKnown;
               const totalOut = stockKnown && (p.totalAmount ?? 0) <= 0;
               const isLow = stockKnown && !totalOut && (p.totalAmount ?? 0) < 10;
 
@@ -782,19 +777,20 @@ export default function Page() {
                           const exists = Boolean(entry);
                           const active = selKey === sz;
 
+                          // Título do tooltip reflete a política conservadora
                           const title = !exists
                             ? "Tamanho não disponível para este produto"
-                            : stockKnown
+                            : variantsKnown
                             ? entry && entry.amount > 0
                               ? `Disponível: ${entry.amount} un.`
                               : "Esgotado neste tamanho"
-                            : "Estoque desconhecido";
+                            : "Estoque indisponível — não vendemos";
 
                           return (
                             <button
                               key={sz}
                               type="button"
-                              disabled={!exists}
+                              disabled={!exists || !variantsKnown || (entry ? entry.amount <= 0 : true)}
                               onClick={() => setSelectedSize((prev) => ({ ...prev, [p.id]: sz }))}
                               className={`px-2.5 py-1 rounded-full border text-xs ${
                                 active ? "text-white border-transparent" : "text-gray-700 border-gray-200 bg-gray-50"
@@ -814,7 +810,7 @@ export default function Page() {
                         {formatPrice(p.price_cents)}
                       </div>
 
-                      {totalOut ? (
+                      {(!stockKnown || totalOut) ? (
                         <span className="px-2 py-1 rounded-full text-xs text-red-700 bg-red-50 border border-red-200">
                           ESGOTADO
                         </span>
@@ -824,7 +820,7 @@ export default function Page() {
                           onClick={() => addToCart(p)}
                           className="p-2 rounded-full shadow-sm disabled:opacity-60"
                           style={{ backgroundColor: ACCENT }}
-                          disabled={sizes.length > 0 && !selectedSize[p.id]}
+                          disabled={(sizes.length > 0 && !selectedSize[p.id])}
                           title={sizes.length > 0 && !selectedSize[p.id] ? "Selecione um tamanho" : "Adicionar"}
                         >
                           <ShoppingCart className="w-4 h-4 text-white" />
@@ -833,7 +829,7 @@ export default function Page() {
                     </div>
 
                     {/* Estoque baixo (total) — só quando conhecido */}
-                    {!totalOut && isLow && (
+                    {stockKnown && !totalOut && isLow && (
                       <div className="mt-2 inline-flex items-center gap-1 text-[11px] text-orange-700 bg-orange-50 border border-orange-200 px-2 py-0.5 rounded-full">
                         <AlertTriangle className="w-3 h-3" />
                         <span>Restam {p.totalAmount} un.</span>
@@ -868,7 +864,6 @@ export default function Page() {
                 </div>
               ) : (
                 cart.map((it) => {
-                  // estoque atual da linha
                   let max: number | undefined;
                   let atMax = false;
 
@@ -877,6 +872,8 @@ export default function Page() {
                       (sizesByProduct[it.product_id] ?? []).find((e) => e.optionId === it.variant_option_id) || null;
                     const varKnown = Boolean(variantKnownByProduct[it.product_id]);
                     max = varKnown ? (varEntry?.amount ?? it.max) : undefined;
+                    // Se não conhecemos, não deixamos passar daqui — mas pela política acima,
+                    // itens com desconhecido nem entram no carrinho.
                     atMax = typeof max === "number" && it.qty >= max;
                   } else {
                     const prod = products.find((p) => p.id === it.product_id);

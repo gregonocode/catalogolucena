@@ -7,11 +7,13 @@ import {
   ChevronLeft,
   ChevronRight,
   Check,
-  X,
+  X as XIcon,
   AlertTriangle,
   ChevronDown,
   ChevronUp,
   Search,
+  Plus,
+  PackageOpen,
 } from "lucide-react";
 
 const ACCENT = "#01A920";
@@ -35,7 +37,6 @@ type RawOrderItemRow = {
   order_id: number;
   quantity: number;
   price_cents: number;
-  // PostgREST pode devolver objeto ou array; tipamos ambos e normalizamos abaixo
   product: ProductLite | ProductLite[] | null;
 };
 
@@ -45,6 +46,13 @@ type OrderItemRow = {
   quantity: number;
   price_cents: number;
   product: ProductLite | null;
+};
+
+type ProductPick = {
+  id: string;
+  title: string;
+  price_cents: number;
+  amount: number | null; // estoque atual (para avisos)
 };
 
 function formatBRL(cents: number) {
@@ -68,6 +76,13 @@ export default function OrdersPage() {
 
   const [search, setSearch] = React.useState("");
 
+  // --- Estados do "Adicionar item" por pedido ---
+  const [productSearchByOrder, setProductSearchByOrder] = React.useState<Record<number, string>>({});
+  const [productResultsByOrder, setProductResultsByOrder] = React.useState<Record<number, ProductPick[]>>({});
+  const [selectedProductByOrder, setSelectedProductByOrder] = React.useState<Record<number, ProductPick | null>>({});
+  const [qtyByOrder, setQtyByOrder] = React.useState<Record<number, number>>({});
+  const [addingItemByOrder, setAddingItemByOrder] = React.useState<Record<number, boolean>>({});
+
   const totalPages = React.useMemo(
     () => Math.max(1, Math.ceil(total / PAGE_SIZE)),
     [total]
@@ -90,9 +105,7 @@ export default function OrdersPage() {
       if (search.trim()) {
         const q = search.trim();
         const maybeHash = q.startsWith("#") ? q : `#${q}`;
-        base = base.or(
-          `order_code.ilike.%${maybeHash}%,customer_name.ilike.%${q}%,customer_phone.ilike.%${q}%`
-        );
+        base = base.or(`order_code.ilike.%${maybeHash}%`);
       }
 
       const { data, error, count } = await base.range(from, to);
@@ -117,10 +130,7 @@ export default function OrdersPage() {
       setExpanding((m) => ({ ...m, [orderId]: true }));
       const { data, error } = await supabase
         .from("order_items")
-        .select(
-          // se souber o nome do FK, pode usar: products!order_items_product_id_fkey
-          "id, order_id, quantity, price_cents, product:products(id, title)"
-        )
+        .select("id, order_id, quantity, price_cents, product:products(id, title)")
         .eq("order_id", orderId)
         .order("id", { ascending: true });
       if (error) throw error;
@@ -144,6 +154,11 @@ export default function OrdersPage() {
       });
 
       setItemsByOrder((prev) => ({ ...prev, [orderId]: normalized }));
+      // defaults do widget de adicionar
+      setQtyByOrder((prev) => ({ ...prev, [orderId]: prev[orderId] ?? 1 }));
+      setSelectedProductByOrder((prev) => ({ ...prev, [orderId]: prev[orderId] ?? null }));
+      setProductSearchByOrder((prev) => ({ ...prev, [orderId]: prev[orderId] ?? "" }));
+      setProductResultsByOrder((prev) => ({ ...prev, [orderId]: prev[orderId] ?? [] }));
     } catch (e) {
       setErr(e instanceof Error ? e.message : "Erro ao carregar itens do pedido");
     } finally {
@@ -194,6 +209,131 @@ export default function OrdersPage() {
     }
   }
 
+  // Remover item (somente pendente)
+  async function removeOrderItem(order: OrderRow, item: OrderItemRow) {
+    try {
+      if (order.status !== "pending") return;
+      setErr(null);
+      setOk(null);
+
+      const { error } = await supabase.from("order_items").delete().eq("id", item.id);
+      if (error) throw error;
+
+      setItemsByOrder((prev) => {
+        const current = prev[order.id] ?? [];
+        const nextItems = current.filter((i) => i.id !== item.id);
+        return { ...prev, [order.id]: nextItems };
+      });
+
+      const delta = item.price_cents * item.quantity;
+      setRows((prev) =>
+        prev.map((r) => (r.id === order.id ? { ...r, total_cents: Math.max(0, r.total_cents - delta) } : r))
+      );
+
+      setOk("Item removido do pedido.");
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Erro ao remover item do pedido");
+    }
+  }
+
+  // Buscar produtos para adicionar
+  async function searchProducts(orderId: number) {
+    try {
+      const term = (productSearchByOrder[orderId] || "").trim();
+      if (!term) {
+        setProductResultsByOrder((prev) => ({ ...prev, [orderId]: [] }));
+        return;
+      }
+      const { data, error } = await supabase
+        .from("products")
+        .select("id, title, price_cents, amount")
+        .ilike("title", `%${term}%`)
+        .order("created_at", { ascending: false })
+        .limit(15);
+      if (error) throw error;
+      setProductResultsByOrder((prev) => ({ ...prev, [orderId]: (data ?? []) as ProductPick[] }));
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Erro ao buscar produtos");
+    }
+  }
+
+  // Adicionar item selecionado ao pedido (somente pendente)
+  async function addItemToOrder(order: OrderRow) {
+    const selected = selectedProductByOrder[order.id];
+    const qty = Math.max(1, qtyByOrder[order.id] ?? 1);
+    if (!selected) {
+      setErr("Selecione um produto");
+      return;
+    }
+    if (order.status !== "pending") {
+      setErr("Apenas pedidos pendentes podem receber itens.");
+      return;
+    }
+
+    try {
+      setErr(null);
+      setOk(null);
+      setAddingItemByOrder((m) => ({ ...m, [order.id]: true }));
+
+      // Segurança: pega preço atual do produto (evita manipulação do cliente)
+      const { data: prod, error: pErr } = await supabase
+        .from("products")
+        .select("id, title, price_cents, amount")
+        .eq("id", selected.id)
+        .maybeSingle<ProductPick>();
+      if (pErr) throw pErr;
+      if (!prod) throw new Error("Produto não encontrado");
+
+      // (Opcional) aviso de estoque baixo/zerado — não bloqueia
+      if ((prod.amount ?? 0) <= 0) {
+        // segue adicionando; consumo real é na aprovação
+        console.warn("Produto com estoque zerado — será possível aprovar apenas se houver ajuste de estoque.");
+      }
+
+      // Insere o item com preço do momento
+      const insertPayload = {
+        order_id: order.id,
+        product_id: prod.id,
+        quantity: qty,
+        price_cents: prod.price_cents,
+      };
+      const { data: inserted, error: iErr } = await supabase
+        .from("order_items")
+        .insert(insertPayload)
+        .select("id")
+        .single<{ id: number }>();
+      if (iErr) throw iErr;
+
+      // Atualiza UI (lista de itens)
+      const newItem: OrderItemRow = {
+        id: inserted.id,
+        order_id: order.id,
+        quantity: qty,
+        price_cents: prod.price_cents,
+        product: { id: prod.id, title: prod.title },
+      };
+      setItemsByOrder((prev) => {
+        const current = prev[order.id] ?? [];
+        return { ...prev, [order.id]: [...current, newItem] };
+      });
+
+      // Atualiza total otimista (trigger também recalcula no BD)
+      const delta = prod.price_cents * qty;
+      setRows((prev) =>
+        prev.map((r) => (r.id === order.id ? { ...r, total_cents: (r.total_cents || 0) + delta } : r))
+      );
+
+      // Reseta seleção/quantidade
+      setSelectedProductByOrder((prev) => ({ ...prev, [order.id]: null }));
+      setQtyByOrder((prev) => ({ ...prev, [order.id]: 1 }));
+      setOk("Item adicionado ao pedido!");
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Erro ao adicionar item ao pedido");
+    } finally {
+      setAddingItemByOrder((m) => ({ ...m, [order.id]: false }));
+    }
+  }
+
   function StatusBadge({ status }: { status: OrderRow["status"] }) {
     if (status === "approved")
       return (
@@ -231,7 +371,7 @@ export default function OrdersPage() {
             <input
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              placeholder="Buscar por #código, cliente ou telefone"
+              placeholder="Buscar por #código"
               className="w-72 px-3 py-2 rounded-xl border border-gray-200"
             />
             <Search className="w-4 h-4 text-gray-500 absolute right-2 top-1/2 -translate-y-1/2" />
@@ -258,13 +398,11 @@ export default function OrdersPage() {
       )}
 
       <div className="rounded-2xl border border-gray-100 overflow-hidden">
-        {/* colunas ajustadas: Status -30px, Criado/Aprovado -40px */}
-        <div className="grid grid-cols-[120px_1fr_140px_110px_120px_120px] gap-0 bg-gray-50 px-3 py-2 text-xs font-medium text-gray-600">
+        <div className="grid grid-cols-[120px_1fr_140px_110px_160px] gap-0 bg-gray-50 px-3 py-2 text-xs font-medium text-gray-600">
           <div>Código</div>
-          
           <div>Total</div>
           <div>Status</div>
-          <div> Criado em:</div>
+          <div>Criado em</div>
           <div className="text-right pr-1">Ações</div>
         </div>
 
@@ -278,10 +416,20 @@ export default function OrdersPage() {
           <ul className="divide-y divide-gray-100">
             {rows.map((r) => {
               const expanded = !!itemsByOrder[r.id];
+              const adding = !!addingItemByOrder[r.id];
+              const canMutate = r.status === "pending";
+              const results = productResultsByOrder[r.id] ?? [];
+              const selected = selectedProductByOrder[r.id] ?? null;
+              const qty = Math.max(1, qtyByOrder[r.id] ?? 1);
+
+              const lowStock =
+                selected && typeof selected.amount === "number" && selected.amount > 0 && selected.amount < 10;
+              const outStock = selected && (selected.amount ?? 0) <= 0;
+
               return (
                 <li key={r.id} className="px-3 py-3">
-                  {/* Linha principal (mesmo grid do header) */}
-                  <div className="grid grid-cols-[120px_1fr_140px_110px_120px_120px] items-center gap-2">
+                  {/* Linha principal */}
+                  <div className="grid grid-cols-[120px_1fr_140px_110px_160px] items-center gap-2">
                     <button
                       onClick={() => toggleExpand(r.id)}
                       className="inline-flex items-center gap-1 text-sm font-medium"
@@ -295,7 +443,6 @@ export default function OrdersPage() {
                       <span>{r.order_code}</span>
                     </button>
 
-                    
                     <div className="text-sm font-semibold whitespace-nowrap">
                       {formatBRL(r.total_cents)}
                     </div>
@@ -304,16 +451,15 @@ export default function OrdersPage() {
                       <StatusBadge status={r.status} />
                     </div>
 
-                    <div className="ml-8 text-xs text-gray-600">
-                      <div> {new Date(r.created_at).toLocaleString("pt-BR")}</div>
-                      
+                    <div className="text-xs text-gray-600">
+                      {new Date(r.created_at).toLocaleString("pt-BR")}
                     </div>
 
-                    <div className="ml-60 flex items-center justify-end gap-2">
+                    <div className="flex items-center justify-end gap-2">
                       <button
                         onClick={() => approve(r.id)}
                         disabled={r.status !== "pending"}
-                        className="px-2 py-1 rounded-lg border border-gray-200 text-xs bg-green disabled:opacity-50 inline-flex items-center gap-1"
+                        className="px-2 py-1 rounded-lg border border-gray-200 text-xs bg-white disabled:opacity-50 inline-flex items-center gap-1"
                         title="Aprovar"
                       >
                         <Check className="w-4 h-4 text-emerald-600" />
@@ -325,7 +471,7 @@ export default function OrdersPage() {
                         className="px-2 py-1 rounded-lg border border-gray-200 text-xs bg-white disabled:opacity-50 inline-flex items-center gap-1"
                         title="Cancelar"
                       >
-                        <X className="w-4 h-4 text-gray-600" />
+                        <XIcon className="w-4 h-4 text-gray-600" />
                         Cancelar
                       </button>
                     </div>
@@ -349,14 +495,32 @@ export default function OrdersPage() {
                           <ul className="divide-y divide-gray-200 bg-white rounded-xl border border-gray-100 overflow-hidden">
                             {itemsByOrder[r.id].map((it) => {
                               const subtotal = it.price_cents * it.quantity;
+                              const canRemove = r.status === "pending";
                               return (
                                 <li
                                   key={it.id}
                                   className="grid grid-cols-[1fr_120px_120px_120px] gap-2 items-center px-3 py-2 text-sm"
                                 >
-                                  <div className="truncate">
-                                    {it.product?.title ?? <span className="text-gray-500">Produto removido</span>}
+                                  {/* Produto + botão X */}
+                                  <div className="truncate flex items-center gap-2">
+                                    <span className="truncate">
+                                      {it.product?.title ?? (
+                                        <span className="text-gray-500">Produto removido</span>
+                                      )}
+                                    </span>
+                                    <button
+                                      type="button"
+                                      onClick={() => removeOrderItem(r, it)}
+                                      disabled={!canRemove}
+                                      className={`ml-1 inline-flex items-center justify-center rounded-md transition-colors
+                                        ${canRemove ? "text-gray-400 hover:text-red-600" : "text-gray-300 cursor-not-allowed"}`}
+                                      title={canRemove ? "Remover item" : "Somente pedidos pendentes"}
+                                      aria-label="Remover item"
+                                    >
+                                      <XIcon className="w-4 h-4" />
+                                    </button>
                                   </div>
+
                                   <div className="text-right pr-2">{formatBRL(it.price_cents)}</div>
                                   <div className="text-right pr-2 tabular-nums">{it.quantity}</div>
                                   <div className="text-right pr-2 font-medium">{formatBRL(subtotal)}</div>
@@ -364,7 +528,133 @@ export default function OrdersPage() {
                               );
                             })}
                           </ul>
-                          <div className="text-right mt-2 text-sm">
+
+                          {/* ---- Adicionar item (somente pendente) ---- */}
+                          <div className="mt-3 p-3 rounded-xl border border-dashed border-gray-300 bg-white">
+                            <div className="text-xs font-medium text-gray-700 mb-2 flex items-center gap-2">
+                              <PackageOpen className="w-4 h-4" />
+                              Adicionar item ao pedido
+                            </div>
+
+                            <div className="flex flex-col md:flex-row gap-2 md:items-end">
+                              {/* Buscar produto */}
+                              <div className="flex-1">
+                                <label className="text-xs text-gray-600">Buscar produto</label>
+                                <div className="flex gap-2">
+                                  <input
+                                    value={productSearchByOrder[r.id] || ""}
+                                    onChange={(e) =>
+                                      setProductSearchByOrder((prev) => ({
+                                        ...prev,
+                                        [r.id]: e.target.value,
+                                      }))
+                                    }
+                                    placeholder="Digite o nome do produto"
+                                    className="w-full px-3 py-2 rounded-xl border border-gray-200"
+                                  />
+                                  <button
+                                    type="button"
+                                    onClick={() => searchProducts(r.id)}
+                                    className="px-3 py-2 rounded-xl border border-gray-200"
+                                    title="Buscar"
+                                  >
+                                    <Search className="w-4 h-4" />
+                                  </button>
+                                </div>
+
+                                {/* Resultados */}
+                                {results.length > 0 && (
+                                  <div className="mt-2 max-h-40 overflow-auto rounded-xl border border-gray-200">
+                                    <ul className="divide-y divide-gray-100 bg-white">
+                                      {results.map((p) => {
+                                        const isSelected = selected?.id === p.id;
+                                        const warnLow = (p.amount ?? 0) > 0 && (p.amount ?? 0) < 10;
+                                        const warnOut = (p.amount ?? 0) <= 0;
+                                        return (
+                                          <li
+                                            key={p.id}
+                                            className={`px-3 py-2 text-sm cursor-pointer flex items-center justify-between
+                                              ${isSelected ? "bg-emerald-50" : "hover:bg-gray-50"}`}
+                                            onClick={() =>
+                                              setSelectedProductByOrder((prev) => ({ ...prev, [r.id]: p }))
+                                            }
+                                          >
+                                            <span className="truncate">{p.title}</span>
+                                            <span className="ml-2 text-xs text-gray-600">
+                                              {formatBRL(p.price_cents)}
+                                            </span>
+                                            {warnOut ? (
+                                              <span className="ml-2 text-[10px] px-2 py-0.5 rounded-full bg-red-50 text-red-700 border border-red-200">
+                                                Esgotado
+                                              </span>
+                                            ) : warnLow ? (
+                                              <span className="ml-2 text-[10px] px-2 py-0.5 rounded-full bg-orange-50 text-orange-700 border border-orange-200">
+                                                {p.amount} un.
+                                              </span>
+                                            ) : null}
+                                          </li>
+                                        );
+                                      })}
+                                    </ul>
+                                  </div>
+                                )}
+                              </div>
+
+                              {/* Quantidade */}
+                              <div className="w-full md:w-40">
+                                <label className="text-xs text-gray-600">Quantidade</label>
+                                <input
+                                  type="number"
+                                  min={1}
+                                  value={qty}
+                                  onChange={(e) =>
+                                    setQtyByOrder((prev) => ({
+                                      ...prev,
+                                      [r.id]: Math.max(1, Number(e.target.value) || 1),
+                                    }))
+                                  }
+                                  className="w-full px-3 py-2 rounded-xl border border-gray-200"
+                                />
+                              </div>
+
+                              {/* Adicionar */}
+                              <div className="w-full md:w-auto">
+                                <button
+                                  type="button"
+                                  onClick={() => addItemToOrder(r)}
+                                  disabled={!canMutate || !selected || adding}
+                                  className="w-full md:w-auto inline-flex items-center gap-2 px-4 py-2 rounded-xl text-white disabled:opacity-50"
+                                  style={{ backgroundColor: ACCENT }}
+                                >
+                                  {adding ? (
+                                    <Loader2 className="w-4 h-4 animate-spin" />
+                                  ) : (
+                                    <Plus className="w-4 h-4" />
+                                  )}
+                                  Adicionar
+                                </button>
+                                {/* Avisos de estoque (não bloqueiam) */}
+                                {selected && outStock && (
+                                  <div className="mt-1 text-[11px] text-red-700">
+                                    Produto esgotado — ajuste o estoque antes de aprovar.
+                                  </div>
+                                )}
+                                {selected && lowStock && !outStock && (
+                                  <div className="mt-1 text-[11px] text-orange-700">
+                                    Estoque baixo ({selected.amount} un.) — verifique antes de aprovar.
+                                  </div>
+                                )}
+                              </div>
+                            </div>
+
+                            {!canMutate && (
+                              <div className="mt-2 text-xs text-gray-600">
+                                Itens só podem ser adicionados quando o pedido está <b>pendente</b>.
+                              </div>
+                            )}
+                          </div>
+
+                          <div className="text-right mt-3 text-sm">
                             <span className="text-gray-600">Total do pedido: </span>
                             <span className="font-semibold">{formatBRL(r.total_cents)}</span>
                           </div>

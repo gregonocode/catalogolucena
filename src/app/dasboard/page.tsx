@@ -19,7 +19,7 @@ export default function DashboardHomePage() {
   const kpis = [
     { label: "Produtos", value: 18, icon: <Package2 className="w-5 h-5" /> },
     { label: "Categorias", value: 6, icon: <Tags className="w-5 h-5" /> },
-    { label: "Orçamentos", value: 42, icon: <ReceiptText className="w-5 h-5" /> },
+    { label: "Pedidos", value: 42, icon: <ReceiptText className="w-5 h-5" /> },
     { label: "Clientes", value: 28, icon: <Users className="w-5 h-5" /> },
   ];
 
@@ -30,9 +30,9 @@ export default function DashboardHomePage() {
   ];
 
   const topProducts = [
-    { id: "p-1", title: "Camiseta Oversized", qty: 32 },
-    { id: "p-2", title: "Calça Jeans Slim", qty: 21 },
-    { id: "p-3", title: "Vestido Midi", qty: 17 },
+    { id: "p-1", title: "Blusa Femninina", qty: 32 },
+    { id: "p-2", title: "Calça Jeans ", qty: 21 },
+    { id: "p-3", title: "Vestido Lucena", qty: 17 },
   ];
 
   function brl(n: number) {
@@ -147,8 +147,8 @@ export default function DashboardHomePage() {
       </section>
 
       {/* Aviso MVP */}
-      <div className="mt-6 p-3 rounded-2xl border border-gray-100 bg-gray-50 text-sm text-gray-700">
-        Continuação em breve — esta tela é um **preview funcional** do que entra na próxima etapa do MVP.
+      <div className="text-center mt-6 p-3 rounded-2xl border border-gray-100 bg-gray-50 text-sm text-gray-700">
+        Continuação em breve — Essa tela  demostrativa do uma dash do MVP
       </div>
     </div>
   );

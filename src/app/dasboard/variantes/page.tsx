@@ -1,7 +1,18 @@
 "use client";
 
 import React from "react";
-import { Layers3, Plus, Loader2, Check, X, Pencil, Trash2, GripVertical, Shirt } from "lucide-react";
+import {
+  Layers3,
+  Plus,
+  Loader2,
+  Check,
+  X,
+  Pencil,
+  Trash2,
+  GripVertical,
+  Shirt,
+  Package2,
+} from "lucide-react";
 import { supabaseBrowser } from "@/lib/supabase-browser";
 
 const ACCENT = "#01A920";
@@ -10,6 +21,9 @@ type Product = { id: string; title: string };
 type VariantGroup = { id: string; product_id: string; name: string; position: number };
 type VariantGroupEditable = VariantGroup & { _editing?: boolean };
 type VariantOption = { id: string; variant_group_id: string; value: string; code: string | null; position: number };
+
+type SizeKey = "P" | "M" | "G" | "GG";
+const SIZE_LABELS: SizeKey[] = ["P", "M", "G", "GG"];
 
 export default function VariantsPage() {
   const supabase = supabaseBrowser();
@@ -22,20 +36,48 @@ export default function VariantsPage() {
   const [options, setOptions] = React.useState<VariantOption[]>([]);
   const [loadingData, setLoadingData] = React.useState(false);
 
-  const [groupName, setGroupName] = React.useState("");
-  const [creatingGroup, setCreatingGroup] = React.useState(false);
-
   const [err, setErr] = React.useState<string | null>(null);
   const [ok, setOk] = React.useState<string | null>(null);
 
-  // helper para recarregar grupos+opções do produto atual
+  // Estado de tamanhos/estoque
+  const [sizeGroupId, setSizeGroupId] = React.useState<string | null>(null);
+  const [sizeOptionIds, setSizeOptionIds] = React.useState<Record<SizeKey, string | null>>({
+    P: null,
+    M: null,
+    G: null,
+    GG: null,
+  });
+  const [sizesSelected, setSizesSelected] = React.useState<Record<SizeKey, boolean>>({
+    P: false,
+    M: false,
+    G: false,
+    GG: false,
+  });
+  const [sizesAmount, setSizesAmount] = React.useState<Record<SizeKey, number>>({
+    P: 0,
+    M: 0,
+    G: 0,
+    GG: 0,
+  });
+  const [loadingSizes, setLoadingSizes] = React.useState(false);
+
+  // Inline edit por tamanho (grupo Tamanho)
+  const [editing, setEditing] = React.useState<Record<SizeKey, boolean>>({
+    P: false,
+    M: false,
+    G: false,
+    GG: false,
+  });
+  const [savingOne, setSavingOne] = React.useState<SizeKey | null>(null);
+
+  // ---------------- Helpers base (carregar dados) ----------------
   async function reloadFor(
     pid: string,
     sb = supabase,
     setG: React.Dispatch<React.SetStateAction<VariantGroupEditable[]>> = setGroups,
     setO: React.Dispatch<React.SetStateAction<VariantOption[]>> = setOptions,
     setL: React.Dispatch<React.SetStateAction<boolean>> = setLoadingData,
-    setE: React.Dispatch<React.SetStateAction<string | null>> = setErr,
+    setE: React.Dispatch<React.SetStateAction<string | null>> = setErr
   ) {
     if (!pid) {
       setG([]);
@@ -81,7 +123,6 @@ export default function VariantsPage() {
     setL(false);
   }
 
-  // 1) Carrega produtos (mínimos)
   React.useEffect(() => {
     let ignore = false;
     (async () => {
@@ -95,8 +136,9 @@ export default function VariantsPage() {
           console.error(error);
           setErr(error.message);
         } else {
-          setProducts((data ?? []) as Product[]);
-          const first = (data && data[0]?.id) || "";
+          const arr = (data ?? []) as Product[];
+          setProducts(arr);
+          const first = arr[0]?.id ?? "";
           setProductId(first);
           if (first) await reloadFor(first);
         }
@@ -108,48 +150,212 @@ export default function VariantsPage() {
     };
   }, [supabase]);
 
-  // 2) Ao trocar produto, recarrega
   React.useEffect(() => {
-    if (productId) reloadFor(productId);
-    else {
+    if (productId) {
+      reloadFor(productId).then(() => loadSizeStockForProduct(productId));
+    } else {
       setGroups([]);
       setOptions([]);
+      resetSizesUI();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [productId]);
 
   const productGroups = React.useMemo(
     () => groups.filter((g) => g.product_id === productId).sort((a, b) => a.position - b.position),
-    [groups, productId],
+    [groups, productId]
   );
 
-  // Criar grupo
-  async function onCreateGroup(e: React.FormEvent<HTMLFormElement>) {
-    e.preventDefault();
-    if (!groupName.trim() || !productId) return;
-    setCreatingGroup(true);
-    setErr(null);
-    setOk(null);
-    try {
-      const nextPos = productGroups.length ? Math.max(...productGroups.map((g) => g.position)) + 1 : 0;
-      const { error } = await supabase
-        .from("variant_groups")
-        .insert({ product_id: productId, name: groupName.trim(), position: nextPos });
-      if (error) throw error;
+  function nextGroupPosition(): number {
+    return productGroups.length ? Math.max(...productGroups.map((g) => g.position)) + 1 : 0;
+  }
 
-      // Recarrega do banco para refletir ordenação e estado real
-      await reloadFor(productId);
-      setGroupName("");
-      setOk("Grupo criado");
+  // ---------------- Tamanhos: carregar/garantir ----------------
+  function resetSizesUI() {
+    setSizeGroupId(null);
+    setSizeOptionIds({ P: null, M: null, G: null, GG: null });
+    setSizesSelected({ P: false, M: false, G: false, GG: false });
+    setSizesAmount({ P: 0, M: 0, G: 0, GG: 0 });
+    setEditing({ P: false, M: false, G: false, GG: false });
+    setSavingOne(null);
+  }
+
+  async function loadSizeStockForProduct(pid: string) {
+    resetSizesUI();
+    if (!pid) return;
+
+    setLoadingSizes(true);
+    setErr(null);
+
+    try {
+      const norm = (s: string) => s.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+
+      // localizar grupo "Tamanho"
+      const sizeGroup = productGroups.find((g) => norm(g.name) === "tamanho") ?? null;
+      setSizeGroupId(sizeGroup?.id ?? null);
+
+      // localizar opções P/M/G/GG
+      const idMap: Record<SizeKey, string | null> = { P: null, M: null, G: null, GG: null };
+      if (sizeGroup) {
+        const szOpts = options
+          .filter((o) => o.variant_group_id === sizeGroup.id)
+          .filter((o) => SIZE_LABELS.includes(o.value as SizeKey));
+        for (const key of SIZE_LABELS) {
+          const opt = szOpts.find((o) => o.value === key);
+          idMap[key] = opt?.id ?? null;
+        }
+      }
+      setSizeOptionIds(idMap);
+
+      // buscar quantidades salvas em product_variants
+      const idsToLoad = Object.values(idMap).filter(Boolean) as string[];
+
+      let pvArr: { variant_option_id: string; amount: number }[] = [];
+      if (idsToLoad.length) {
+        const { data: pvRows } = await supabase
+          .from("product_variants")
+          .select("variant_option_id, amount")
+          .eq("product_id", pid)
+          .in("variant_option_id", idsToLoad);
+        pvArr = (pvRows ?? []) as { variant_option_id: string; amount: number }[];
+      }
+
+      // Sempre marcar como selecionado se existir a option (persistência pós-refresh)
+      const amt: Record<SizeKey, number> = { P: 0, M: 0, G: 0, GG: 0 };
+      const sel: Record<SizeKey, boolean> = { P: false, M: false, G: false, GG: false };
+      for (const key of SIZE_LABELS) {
+        const vid = idMap[key];
+        if (vid) {
+          sel[key] = true; // <-- selecionado se existir variant_option
+          const found = pvArr.find((r) => r.variant_option_id === vid);
+          amt[key] = Number.isFinite(found?.amount as number) ? (found!.amount as number) : 0;
+        }
+      }
+      setSizesAmount(amt);
+      setSizesSelected(sel);
     } catch (e) {
-      const msg = e instanceof Error ? e.message : "Erro ao criar grupo";
+      const msg = e instanceof Error ? e.message : "Erro ao carregar tamanhos";
       setErr(msg);
     } finally {
-      setCreatingGroup(false);
+      setLoadingSizes(false);
     }
   }
 
-  // Editar grupo
+  async function ensureSizeGroup(): Promise<string> {
+    const norm = (s: string) => s.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+    const existing = productGroups.find((g) => norm(g.name) === "tamanho");
+    if (existing) return existing.id;
+
+    const { data, error } = await supabase
+      .from("variant_groups")
+      .insert({ product_id: productId, name: "Tamanho", position: nextGroupPosition() })
+      .select("id, product_id, name, position")
+      .single<VariantGroup>();
+    if (error) throw error;
+
+    await reloadFor(productId);
+    setSizeGroupId(data.id);
+    return data.id;
+  }
+
+  async function ensureOneSizeOption(gid: string, size: SizeKey): Promise<string> {
+    // já existe?
+    const existing = options.find((o) => o.variant_group_id === gid && o.value === size);
+    if (existing) return existing.id;
+
+    const positionBase = options.filter((o) => o.variant_group_id === gid).length;
+    const { data, error } = await supabase
+      .from("variant_options")
+      .insert({ variant_group_id: gid, value: size, code: size, position: positionBase })
+      .select("id")
+      .single<{ id: string }>();
+    if (error) throw error;
+
+    await reloadFor(productId);
+    return data.id;
+  }
+
+  // Toggle inline (cria/remove imediatamente)
+  async function toggleSize(size: SizeKey) {
+    if (!productId) return;
+    setErr(null);
+    setOk(null);
+
+    try {
+      const turningOn = !sizesSelected[size];
+
+      if (turningOn) {
+        // cria grupo (se faltar) e option para esse tamanho
+        const gid = await ensureSizeGroup();
+        const optId = await ensureOneSizeOption(gid, size);
+
+        // upsert product_variants com quantidade atual (ou 0)
+        const amount = Math.max(0, Math.trunc(Number(sizesAmount[size] ?? 0)));
+        const { error: upErr } = await supabase
+          .from("product_variants")
+          .upsert({ product_id: productId, variant_option_id: optId, amount }, { onConflict: "product_id,variant_option_id" });
+        if (upErr) throw upErr;
+
+        setSizesSelected((p) => ({ ...p, [size]: true }));
+        setSizeOptionIds((p) => ({ ...p, [size]: optId }));
+        setOk(`Tamanho ${size} criado.`);
+      } else {
+        // desativar: remover product_variants + variant_option
+        const optId = sizeOptionIds[size];
+        if (optId) {
+          const { error: delPvErr } = await supabase
+            .from("product_variants")
+            .delete()
+            .eq("product_id", productId)
+            .eq("variant_option_id", optId);
+          if (delPvErr) throw delPvErr;
+
+          const { error: delOptErr } = await supabase.from("variant_options").delete().eq("id", optId);
+          if (delOptErr) throw delOptErr;
+        }
+
+        setSizesSelected((p) => ({ ...p, [size]: false }));
+        setSizesAmount((p) => ({ ...p, [size]: 0 }));
+        setSizeOptionIds((p) => ({ ...p, [size]: null }));
+
+        await reloadFor(productId);
+        setOk(`Tamanho ${size} removido.`);
+      }
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Erro ao alternar tamanho");
+    }
+  }
+
+  // Salvar apenas 1 quantidade (inline)
+  async function saveSingleSize(size: SizeKey) {
+    if (!productId) return;
+    const optId = sizeOptionIds[size];
+    if (!optId) return;
+
+    setSavingOne(size);
+    setErr(null);
+    setOk(null);
+
+    try {
+      const amount = Math.max(0, Math.trunc(Number(sizesAmount[size] ?? 0)));
+      const row = { product_id: productId, variant_option_id: optId, amount };
+
+      const { error: upErr } = await supabase
+        .from("product_variants")
+        .upsert(row, { onConflict: "product_id,variant_option_id" });
+      if (upErr) throw upErr;
+
+      setEditing((prev) => ({ ...prev, [size]: false }));
+      setOk(`Estoque de ${size} atualizado.`);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Erro ao salvar quantidade";
+      setErr(msg);
+    } finally {
+      setSavingOne(null);
+    }
+  }
+
+  // ---------------- CRUD básico de grupos/opções (outros grupos) ----------------
   function startEditGroup(id: string) {
     setGroups((prev) => prev.map((g) => (g.id === id ? { ...g, _editing: true } : g)));
   }
@@ -165,15 +371,11 @@ export default function VariantsPage() {
         .select("id, product_id, name, position")
         .single<VariantGroup>();
       if (error) throw error;
-
       setGroups((prev) => prev.map((g) => (g.id === id ? { ...data, _editing: false } : g)));
     } catch (e) {
-      const msg = e instanceof Error ? e.message : "Erro ao salvar grupo";
-      setErr(msg);
+      setErr(e instanceof Error ? e.message : "Erro ao salvar grupo");
     }
   }
-
-  // Remover grupo (cascade remove options pelo FK)
   async function removeGroup(id: string) {
     if (!confirm("Remover grupo e suas opções?")) return;
     try {
@@ -181,13 +383,11 @@ export default function VariantsPage() {
       if (error) throw error;
       setGroups((prev) => prev.filter((g) => g.id !== id));
       await reloadFor(productId);
+      if (id === sizeGroupId) resetSizesUI();
     } catch (e) {
-      const msg = e instanceof Error ? e.message : "Erro ao remover grupo";
-      setErr(msg);
+      setErr(e instanceof Error ? e.message : "Erro ao remover grupo");
     }
   }
-
-  // Opções
   async function addOption(groupId: string, value: string, code?: string) {
     if (!value.trim()) return;
     try {
@@ -200,12 +400,11 @@ export default function VariantsPage() {
       });
       if (error) throw error;
       await reloadFor(productId);
+      if (groupId === sizeGroupId) await loadSizeStockForProduct(productId);
     } catch (e) {
-      const msg = e instanceof Error ? e.message : "Erro ao adicionar opção";
-      setErr(msg);
+      setErr(e instanceof Error ? e.message : "Erro ao adicionar opção");
     }
   }
-
   async function saveOption(optId: string, payload: Partial<VariantOption>) {
     try {
       const { error } = await supabase
@@ -214,34 +413,34 @@ export default function VariantsPage() {
         .eq("id", optId);
       if (error) throw error;
       await reloadFor(productId);
+      await loadSizeStockForProduct(productId);
     } catch (e) {
-      const msg = e instanceof Error ? e.message : "Erro ao salvar opção";
-      setErr(msg);
+      setErr(e instanceof Error ? e.message : "Erro ao salvar opção");
     }
   }
-
   async function deleteOption(optId: string) {
     if (!confirm("Remover opção?")) return;
     try {
       const { error } = await supabase.from("variant_options").delete().eq("id", optId);
       if (error) throw error;
       await reloadFor(productId);
+      await loadSizeStockForProduct(productId);
     } catch (e) {
-      const msg = e instanceof Error ? e.message : "Erro ao remover opção";
-      setErr(msg);
+      setErr(e instanceof Error ? e.message : "Erro ao remover opção");
     }
   }
 
+  // ---------------- UI ----------------
   return (
     <div className="max-w-screen-sm mx-auto">
       <div className="flex items-center justify-between mb-4">
         <h1 className="text-lg font-semibold">Variantes</h1>
         <span className="inline-flex items-center gap-1 text-xs text-gray-500">
-          <Layers3 className="w-4 h-4" /> grupos (ex.: Cor, Tamanho) e opções
+          <Layers3 className="w-4 h-4" /> Tamanho (P, M, G, GG)
         </span>
       </div>
 
-      {/* Seletor de produto */}
+      {/* Produto */}
       <div className="mb-4">
         <label className="text-sm text-gray-700">Produto</label>
         <div className="mt-1 relative">
@@ -263,36 +462,60 @@ export default function VariantsPage() {
         </div>
       </div>
 
-      {/* Criar grupo */}
-      <form onSubmit={onCreateGroup} className="space-y-2 mb-6">
-        <div className="space-y-1">
-          <label className="text-sm text-gray-700">Novo grupo</label>
-          <input
-            value={groupName}
-            onChange={(e) => setGroupName(e.target.value)}
-            placeholder="Ex.: Cor"
-            className="w-full px-3 py-2 rounded-xl border border-gray-200 focus:outline-none focus:ring-4"
-            disabled={!productId}
-          />
-        </div>
-        <button
-          type="submit"
-          disabled={creatingGroup || !productId}
-          className="inline-flex items-center gap-2 px-4 py-2 rounded-xl text-white shadow-sm active:scale-[0.99]"
-          style={{ backgroundColor: ACCENT }}
-        >
-          {creatingGroup ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}
-          Criar grupo
-        </button>
-      </form>
+      {/* CARD — Chips criam/removem na hora */}
+      <section className="mb-6 rounded-2xl border border-gray-100 bg-white shadow-sm overflow-hidden">
+        <header className="flex items-center justify-between px-3 py-2 border-b border-gray-100">
+          <div className="flex items-center gap-2">
+            <span className="grid place-items-center w-7 h-7 rounded-md bg-gray-100 border border-gray-200">
+              <Package2 className="w-4 h-4 text-gray-600" />
+            </span>
+            <h2 className="text-sm font-medium">Selecionar tamanhos</h2>
+          </div>
+        </header>
 
-      {/* Lista de grupos com opções */}
+        <div className="p-3">
+          {loadingSizes ? (
+            <div className="p-3 rounded-xl border border-gray-100 bg-gray-50 text-sm text-gray-600">
+              Carregando tamanhos...
+            </div>
+          ) : (
+            <>
+              <div className="mb-2 text-xs text-gray-500">
+                Clique no tamanho para <b>criar/remover</b>. Edite a <b>quantidade</b> na lista do grupo <b>Tamanho</b> abaixo.
+              </div>
+              <div className="flex flex-wrap gap-2">
+                {SIZE_LABELS.map((sz) => {
+                  const active = sizesSelected[sz];
+                  return (
+                    <button
+                      key={sz}
+                      type="button"
+                      onClick={() => toggleSize(sz)}
+                      className={`px-3 py-1.5 rounded-full border text-sm transition ${
+                        active ? "text-white border-transparent" : "text-gray-700 border-gray-200 bg-gray-50"
+                      }`}
+                      style={active ? { backgroundColor: ACCENT } : {}}
+                      title={active ? "Remover tamanho" : "Criar tamanho"}
+                    >
+                      {sz}
+                    </button>
+                  );
+                })}
+              </div>
+            </>
+          )}
+        </div>
+      </section>
+
+      {/* Lista de grupos/opções existentes */}
       {loadingData ? (
         <div className="p-3 rounded-xl border border-gray-100 bg-gray-50 text-sm text-gray-600">Carregando...</div>
       ) : (
         <div className="space-y-3">
           {productGroups.length === 0 ? (
-            <div className="p-3 rounded-xl border border-gray-100 bg-gray-50 text-sm text-gray-600">Nenhum grupo criado.</div>
+            <div className="p-3 rounded-xl border border-gray-100 bg-gray-50 text-sm text-gray-600">
+              Nenhum grupo criado.
+            </div>
           ) : null}
 
           {productGroups.map((g) => (
@@ -303,30 +526,50 @@ export default function VariantsPage() {
                     <GripVertical className="w-4 h-4 text-gray-600" />
                   </span>
                   {g._editing ? (
-                    <GroupEditInline name={g.name} onCancel={() => cancelEditGroup(g.id)} onSave={(name) => saveEditGroup(g.id, name)} />
+                    <GroupEditInline
+                      name={g.name}
+                      onCancel={() => cancelEditGroup(g.id)}
+                      onSave={(name) => saveEditGroup(g.id, name)}
+                    />
                   ) : (
                     <h2 className="text-sm font-medium">{g.name}</h2>
                   )}
                 </div>
                 <div className="flex items-center gap-1.5">
                   {g._editing ? null : (
-                    <button onClick={() => startEditGroup(g.id)} className="px-2 py-1 rounded-lg border border-gray-200 text-xs bg-white">
+                    <button
+                      onClick={() => startEditGroup(g.id)}
+                      className="px-2 py-1 rounded-lg border border-gray-200 text-xs bg-white"
+                    >
                       <Pencil className="w-4 h-4" />
                     </button>
                   )}
-                  <button onClick={() => removeGroup(g.id)} className="px-2 py-1 rounded-lg border border-gray-200 text-xs bg-white">
+                  <button
+                    onClick={() => removeGroup(g.id)}
+                    className="px-2 py-1 rounded-lg border border-gray-200 text-xs bg-white"
+                  >
                     <Trash2 className="w-4 h-4" />
                   </button>
                 </div>
               </header>
 
-              {/* Opções do grupo */}
               <OptionsList
                 groupId={g.id}
-                options={options.filter((o) => o.variant_group_id === g.id).sort((a, b) => a.position - b.position)}
+                isSizeGroup={g.id === sizeGroupId}
+                options={options
+                  .filter((o) => o.variant_group_id === g.id)
+                  .sort((a, b) => a.position - b.position)}
                 onAdd={addOption}
                 onSave={saveOption}
                 onDelete={deleteOption}
+                amountBySize={sizesAmount}
+                onAmountChange={(sz, val) =>
+                  setSizesAmount((prev) => ({ ...prev, [sz]: Math.max(0, Math.trunc(val)) }))
+                }
+                editingBySize={editing}
+                onStartEditSize={(sz) => setEditing((prev) => ({ ...prev, [sz]: true }))}
+                onSaveSingleSize={saveSingleSize}
+                savingOne={savingOne}
               />
             </section>
           ))}
@@ -352,8 +595,8 @@ function GroupEditInline({
   onCancel: () => void;
   onSave: (name: string) => void;
 }) {
-  const [v, setV] = React.useState(name);
-  const [saving, setSaving] = React.useState(false);
+  const [v, setV] = React.useState<string>(name);
+  const [saving, setSaving] = React.useState<boolean>(false);
 
   async function handleSave() {
     if (!v.trim()) return;
@@ -380,34 +623,54 @@ function GroupEditInline({
 
 function OptionsList({
   groupId,
+  isSizeGroup,
   options,
   onAdd,
   onSave,
   onDelete,
+  amountBySize,
+  onAmountChange,
+  editingBySize,
+  onStartEditSize,
+  onSaveSingleSize,
+  savingOne,
 }: {
   groupId: string;
+  isSizeGroup: boolean;
   options: VariantOption[];
   onAdd: (groupId: string, value: string, code?: string) => void;
   onSave: (optId: string, payload: Partial<VariantOption>) => void;
   onDelete: (optId: string) => void;
+
+  amountBySize: Record<SizeKey, number>;
+  onAmountChange: (sz: SizeKey, val: number) => void;
+  editingBySize: Record<SizeKey, boolean>;
+  onStartEditSize: (sz: SizeKey) => void;
+  onSaveSingleSize: (sz: SizeKey) => void;
+  savingOne: SizeKey | null;
 }) {
-  const [value, setValue] = React.useState("");
-  const [code, setCode] = React.useState("");
+  const [value, setValue] = React.useState<string>("");
+  const [code, setCode] = React.useState<string>("");
+
+  function toSizeKey(v: string): SizeKey | null {
+    if (v === "P" || v === "M" || v === "G" || v === "GG") return v;
+    return null;
+  }
 
   return (
     <div className="p-3">
-      {/* Form inline para criar opção */}
+      {/* Form inline para criar opção (mantido p/ outros grupos) */}
       <div className="flex items-center gap-2 mb-3">
         <input
           value={value}
           onChange={(e) => setValue(e.target.value)}
-          placeholder="Opção (ex.: Vermelho, P)"
+          placeholder="Opção (ex.: Vermelho)"
           className="flex-1 px-3 py-2 rounded-xl border border-gray-200"
         />
         <input
           value={code}
           onChange={(e) => setCode(e.target.value)}
-          placeholder="Código (ex.: red, P)"
+          placeholder="Código (opcional)"
           className="w-40 px-3 py-2 rounded-xl border border-gray-200"
         />
         <button
@@ -423,21 +686,85 @@ function OptionsList({
         </button>
       </div>
 
-      {/* Lista de opções */}
+      {/* Lista de opções do grupo */}
       <ul className="space-y-2">
-        {options.map((o) => (
-          <li key={o.id} className="flex items-center justify-between p-2 rounded-xl border border-gray-100 bg-gray-50">
-            <div className="flex items-center gap-2">
-              <span className="grid place-items-center w-7 h-7 rounded-md bg-white border border-gray-200">
-                <GripVertical className="w-4 h-4 text-gray-600" />
-              </span>
-              <OptionInline opt={o} onSave={onSave} />
-            </div>
-            <button onClick={() => onDelete(o.id)} className="px-2 py-1 rounded-lg border border-gray-200 text-xs bg-white">
-              <Trash2 className="w-4 h-4" />
-            </button>
-          </li>
-        ))}
+        {options.map((o) => {
+          const sz = isSizeGroup ? toSizeKey(o.value) : null;
+          const isEditableSize = Boolean(isSizeGroup && sz);
+
+          return (
+            <li key={o.id} className="flex items-center justify-between p-2 rounded-xl border border-gray-100 bg-gray-50">
+              {/* Esquerda: editar nome/código da opção */}
+              <div className="flex items-center gap-2">
+                <span className="grid place-items-center w-7 h-7 rounded-md bg-white border border-gray-200">
+                  <GripVertical className="w-4 h-4 text-gray-600" />
+                </span>
+                <OptionInline opt={o} onSave={onSave} />
+              </div>
+
+              {/* Meio: QTD inline SEMPRE visível (P/M/G/GG) com label */}
+              {isEditableSize ? (
+                <div className="flex items-center gap-2">
+                  <span className="text-xs text-gray-600">Qtd:</span>
+                  {editingBySize[sz!] ? (
+                    <>
+                      <input
+                        type="number"
+                        inputMode="numeric"
+                        min={0}
+                        step={1}
+                        value={Number.isFinite(amountBySize[sz!]) ? amountBySize[sz!] : 0}
+                        onChange={(e) => {
+                          const n = Math.trunc(Number(e.target.value));
+                          onAmountChange(sz!, Number.isNaN(n) ? 0 : n);
+                        }}
+                        className="w-24 px-3 py-1.5 rounded-lg border border-gray-200 bg-white"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => onSaveSingleSize(sz!)}
+                        disabled={savingOne === sz}
+                        className="px-2 py-1 rounded-lg text-white text-xs"
+                        style={{ backgroundColor: ACCENT }}
+                        title="Salvar quantidade"
+                      >
+                        {savingOne === sz ? (
+                          <Loader2 className="w-4 h-4 animate-spin" />
+                        ) : (
+                          <Check className="w-4 h-4" />
+                        )}
+                      </button>
+                    </>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => onStartEditSize(sz!)}
+                      className="text-sm font-semibold tabular-nums px-2 py-1 rounded-md border border-transparent hover:border-gray-200 bg-white"
+                      title="Clique para editar a quantidade"
+                    >
+                      {Number.isFinite(amountBySize[sz!]) ? amountBySize[sz!] : 0}
+                    </button>
+                  )}
+                </div>
+              ) : (
+                <div />
+              )}
+
+              {/* Direita: Lixeira — OCULTA no grupo Tamanho */}
+              {isEditableSize ? (
+                <div className="w-4 h-4" /> // placeholder para manter alinhamento
+              ) : (
+                <button
+                  onClick={() => onDelete(o.id)}
+                  className="px-2 py-1 rounded-lg border border-gray-200 text-xs bg-white"
+                  title="Excluir opção"
+                >
+                  <Trash2 className="w-4 h-4" />
+                </button>
+              )}
+            </li>
+          );
+        })}
       </ul>
     </div>
   );
@@ -450,9 +777,9 @@ function OptionInline({
   opt: VariantOption;
   onSave: (optId: string, payload: Partial<VariantOption>) => void;
 }) {
-  const [v, setV] = React.useState(opt.value);
-  const [c, setC] = React.useState(opt.code || "");
-  const [saving, setSaving] = React.useState(false);
+  const [v, setV] = React.useState<string>(opt.value);
+  const [c, setC] = React.useState<string>(opt.code || "");
+  const [saving, setSaving] = React.useState<boolean>(false);
 
   async function handleSave() {
     if (!v.trim()) return;

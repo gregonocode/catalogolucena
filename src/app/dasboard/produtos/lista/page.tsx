@@ -19,14 +19,16 @@ import { supabaseBrowser } from "@/lib/supabase-browser";
 const ACCENT = "#01A920";
 const PAGE_SIZE = 10;
 
-type ProductRow = {
+/** Linhas vindas da VIEW products_with_stock (p.* + total_stock) */
+type ProductWithStockRow = {
   id: string;
   title: string;
   description: string | null;
   price_cents: number;
   active: boolean;
   created_at: string;
-  amount: number; // estoque
+  /** soma das variantes */
+  total_stock: number;
 };
 
 type ProductImage = {
@@ -37,7 +39,7 @@ type ProductImage = {
 };
 
 type ListItem = {
-  product: ProductRow;
+  product: ProductWithStockRow;
   imgUrl: string | null;
 };
 
@@ -54,7 +56,7 @@ export default function ProductsListPage() {
   const supabase = supabaseBrowser();
 
   const [search, setSearch] = React.useState("");
-  const [orderBy, setOrderBy] = React.useState<keyof ProductRow>("created_at");
+  const [orderBy, setOrderBy] = React.useState<keyof ProductWithStockRow | "total_stock">("created_at");
   const [ascending, setAscending] = React.useState(false);
 
   const [page, setPage] = React.useState(0);
@@ -81,23 +83,27 @@ export default function ProductsListPage() {
       const from = page * PAGE_SIZE;
       const to = from + PAGE_SIZE - 1;
 
+      // Busca na VIEW: products_with_stock
       let query = supabase
-        .from("products")
+        .from("products_with_stock")
         .select("*", { count: "exact" })
         .order(orderBy as string, { ascending });
 
       if (search.trim()) {
         const q = search.trim();
+        // title / description existem na view (vêm de products.*)
         query = query.or(`title.ilike.%${q}%,description.ilike.%${q}%`);
       }
 
-      const { data: products, count, error: prodErr } = await query.range(from, to);
-      if (prodErr) throw prodErr;
+      const { data, count, error } = await query.range(from, to);
+      if (error) throw error;
 
-      setTotal(count || 0);
-      const list: ProductRow[] = Array.isArray(products) ? (products as ProductRow[]) : [];
+      setTotal(count ?? 0);
+      const list: ProductWithStockRow[] = Array.isArray(data)
+        ? (data as ProductWithStockRow[])
+        : [];
 
-      if (!list.length) {
+      if (list.length === 0) {
         setRows([]);
         setLoading(false);
         return;
@@ -105,13 +111,14 @@ export default function ProductsListPage() {
 
       const ids = list.map((p) => p.id);
 
-      // Imagens (não aborta em erro)
+      // Carregar imagens principais (não aborta em erro)
       const byProductImgs = new Map<string, ProductImage[]>();
       try {
         const { data: imgs, error: imgErr } = await supabase
           .from("product_images")
           .select("id, product_id, storage_path, is_primary")
           .in("product_id", ids);
+
         if (imgErr) throw imgErr;
 
         const arr: ProductImage[] = Array.isArray(imgs) ? (imgs as ProductImage[]) : [];
@@ -125,7 +132,7 @@ export default function ProductsListPage() {
         setWarns((w) => [...w, `product_images: ${errorMessage(e)}`]);
       }
 
-      // Monta itens (sem categorias; estoque ocupa a coluna no lugar delas)
+      // Montar a lista com a URL pública da imagem primária
       const items: ListItem[] = list.map((p) => {
         const imgsFor = byProductImgs.get(p.id) ?? [];
         const primary =
@@ -134,8 +141,8 @@ export default function ProductsListPage() {
 
         let imgUrl: string | null = null;
         if (primary?.storage_path) {
-          const { data } = supabase.storage.from("produtos").getPublicUrl(primary.storage_path);
-          imgUrl = data.publicUrl ?? null;
+          const { data: pub } = supabase.storage.from("produtos").getPublicUrl(primary.storage_path);
+          imgUrl = pub?.publicUrl ?? null;
         }
 
         return { product: p, imgUrl };
@@ -180,37 +187,44 @@ export default function ProductsListPage() {
   }
 
   async function handleDelete(productId: string) {
-    if (!confirm("Tem certeza que deseja excluir este produto? As imagens no storage também serão removidas."))
+    if (!confirm("Tem certeza que deseja excluir este produto? As imagens no storage também serão removidas.")) {
       return;
+    }
 
     setErr(null);
     setOk(null);
 
     try {
+      // 1) Remover arquivos do storage (se houver)
       const { data: imgs, error: imgErr } = await supabase
         .from("product_images")
         .select("storage_path")
         .eq("product_id", productId);
+
       if (imgErr) throw imgErr;
 
-      const paths = (Array.isArray(imgs) ? imgs : [])
+      const paths: string[] = (Array.isArray(imgs) ? imgs : [])
         .map((i) => (i as { storage_path: string | null }).storage_path)
-        .filter((p): p is string => typeof p === "string" && p.length > 0);
+        .filter((pth): pth is string => typeof pth === "string" && pth.length > 0);
 
       if (paths.length) {
         const { error: remErr } = await supabase.storage.from("produtos").remove(paths);
         if (remErr) console.warn("Falha ao remover arquivos:", remErr.message);
       }
 
+      // 2) Remover linhas relacionadas (FKs com CASCADE já ajudam, mas limpamos helpers)
       await supabase.from("product_images").delete().eq("product_id", productId);
       await supabase.from("product_categories").delete().eq("product_id", productId);
+      // product_variants será removida por ON DELETE CASCADE (FK em product_variants.product_id)
 
+      // 3) Remover o produto
       const { error: delErr } = await supabase.from("products").delete().eq("id", productId);
       if (delErr) throw delErr;
 
+      // 4) Atualizar UI
       setRows((prev) => prev.filter((it) => it.product.id !== productId));
       setOk("Produto excluído");
-      if ((rows.length - 1) === 0 && page > 0) setPage((p) => p - 1);
+      if (rows.length - 1 === 0 && page > 0) setPage((p) => p - 1);
       else setTotal((t) => Math.max(0, t - 1));
     } catch (e: unknown) {
       setErr(errorMessage(e));
@@ -232,7 +246,11 @@ export default function ProductsListPage() {
             />
             <Search className="w-4 h-4 text-gray-500 absolute right-2 top-1/2 -translate-y-1/2" />
           </div>
-          <button type="submit" className="px-3 py-2 rounded-xl text-white" style={{ backgroundColor: ACCENT }}>
+          <button
+            type="submit"
+            className="px-3 py-2 rounded-xl text-white"
+            style={{ backgroundColor: ACCENT }}
+          >
             Buscar
           </button>
         </form>
@@ -262,13 +280,15 @@ export default function ProductsListPage() {
         <label className="text-sm text-gray-700">Ordenar por:</label>
         <select
           value={orderBy}
-          onChange={(e) => setOrderBy(e.target.value as keyof ProductRow)}
+          onChange={(e) =>
+            setOrderBy(e.target.value as "created_at" | "title" | "price_cents" | "total_stock" | "active")
+          }
           className="px-2 py-1 rounded-lg border border-gray-200 text-sm"
         >
           <option value="created_at">Criação</option>
           <option value="title">Nome</option>
           <option value="price_cents">Preço</option>
-          <option value="amount">Estoque</option>
+          <option value="total_stock">Estoque Total</option>
           <option value="active">Status</option>
         </select>
         <button
@@ -282,12 +302,11 @@ export default function ProductsListPage() {
       </div>
 
       <div className="rounded-2xl border border-gray-100 overflow-hidden">
-        {/* ⬅️ Grid ORIGINAL, apenas trocando Categorias -> Estoque */}
         <div className="grid grid-cols-[80px_1fr_140px_140px_120px_120px] gap-0 bg-gray-50 px-3 py-2 text-xs font-medium text-gray-600">
           <div>Imagem</div>
           <div>Produto</div>
           <div>Preço</div>
-          <div>Estoque</div> {/* antes: Categorias */}
+          <div>Estoque</div>
           <div>Status</div>
           <div className="text-right pr-1">Ações</div>
         </div>
@@ -302,8 +321,9 @@ export default function ProductsListPage() {
           <ul className="divide-y divide-gray-100">
             {rows.map((it) => {
               const p = it.product;
-              const isOut = p.amount <= 0;
-              const isLow = !isOut && p.amount < 10;
+              const totalStock = Number.isFinite(p.total_stock) ? p.total_stock : 0;
+              const isOut = totalStock <= 0;
+              const isLow = !isOut && totalStock < 10;
 
               return (
                 <li
@@ -320,7 +340,7 @@ export default function ProductsListPage() {
                     )}
                   </div>
 
-                  {/* Produto (nome em cima, data embaixo, sem amontoar) */}
+                  {/* Produto */}
                   <div className="min-w-0">
                     <div className="font-medium truncate">{p.title}</div>
                     <div className="text-xs text-gray-500 mt-0.5">
@@ -328,17 +348,17 @@ export default function ProductsListPage() {
                     </div>
                   </div>
 
-                  {/* Preço (sem quebra) */}
+                  {/* Preço */}
                   <div className="text-sm whitespace-nowrap">{formatBRLFromCents(p.price_cents)}</div>
 
-                  {/* Estoque ocupando a coluna que era de Categorias */}
+                  {/* Estoque total (da view) */}
                   <div className="text-sm">
                     {isOut ? (
                       <span className="px-2 py-0.5 rounded-full text-red-700 bg-red-50 border border-red-200 text-xs font-medium">
                         Esgotado
                       </span>
                     ) : (
-                      <span className={`tabular-nums ${isLow ? "text-orange-600" : "text-gray-800"}`}>{p.amount}</span>
+                      <span className={`tabular-nums ${isLow ? "text-orange-600" : "text-gray-800"}`}>{totalStock}</span>
                     )}
                   </div>
 

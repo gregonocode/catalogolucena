@@ -15,18 +15,22 @@ type Product = {
   description: string | null;
   price_cents: number;
   active: boolean;
+  amount: number | null; // estoque do produto (para itens sem variação)
 };
 
 type ImageRow = { storage_path: string; is_primary: boolean | null };
 
+type VariantGroup = { id: string; name: string; position: number };
+type VariantOptionRow = { id: string; variant_group_id: string; value: string; position: number | null };
+
 type SizeKey = "P" | "M" | "G" | "GG";
 const SIZE_LABELS: SizeKey[] = ["P", "M", "G", "GG"];
-
 type SizeEntry = { key: SizeKey; optionId: string; amount: number };
 
-// Item do carrinho (mesmo shape da home)
-type CartItem = {
-  id: string; // `${product_id}:${variant_option_id}`
+/** Cart discriminado para evitar erro de excesso de propriedades */
+type CartItemVariant = {
+  kind: "variant";                  // discriminante
+  id: string;                       // `${product_id}:${variant_option_id}`
   product_id: string;
   variant_option_id: string;
   size: SizeKey;
@@ -34,8 +38,21 @@ type CartItem = {
   price_cents: number;
   imageUrl: string | null;
   qty: number;
-  max?: number; // estoque da variante
+  max?: number;
 };
+
+type CartItemSimple = {
+  kind: "simple";                   // discriminante
+  id: string;                       // `${product_id}`
+  product_id: string;
+  title: string;
+  price_cents: number;
+  imageUrl: string | null;
+  qty: number;
+  max?: number;
+};
+
+type CartItem = CartItemVariant | CartItemSimple;
 
 /* ===================== Utils ===================== */
 const CART_KEY = "cart_v2_sizes";
@@ -69,7 +86,8 @@ function countCartLS(): number {
   return items.reduce((sum, it) => sum + it.qty, 0);
 }
 
-// Insere/atualiza item somando quantidades, respeitando limite (max)
+// Insere/atualiza item somando quantidades, respeitando limite (max).
+// Aceita tanto item com variante quanto sem variante (união discriminada).
 function upsertCartLS(item: Omit<CartItem, "qty">, addQty: number, max?: number): CartItem[] {
   const cart = readCartLS();
   const idx = cart.findIndex((x) => x.id === item.id);
@@ -78,14 +96,14 @@ function upsertCartLS(item: Omit<CartItem, "qty">, addQty: number, max?: number)
     const cur = cart[idx];
     const limit = typeof max === "number" ? max : cur.max ?? undefined;
     const nextQty = limit ? Math.min(cur.qty + addQty, limit) : cur.qty + addQty;
-    const next: CartItem = { ...cur, qty: Math.max(1, nextQty), max: limit };
+    const next = { ...(cur as any), qty: Math.max(1, nextQty), max: limit } as CartItem;
     const updated = [...cart];
     updated[idx] = next;
     return updated;
   }
 
   const firstQty = Math.max(1, typeof max === "number" ? Math.min(addQty, max) : addQty);
-  return [...cart, { ...item, qty: firstQty, max }];
+  return [...cart, { ...(item as any), qty: firstQty, max } as CartItem];
 }
 
 /* ===================== Página ===================== */
@@ -102,12 +120,9 @@ export default function ProductDetailsPage() {
   const [images, setImages] = React.useState<string[]>([]);
   const [activeImg, setActiveImg] = React.useState(0);
 
-  // tamanhos do produto + seleção
-  const [sizes, setSizes] = React.useState<SizeEntry[]>([]);
+  // Grupo de tamanho (se existir) + opções P/M/G/GG e estoque por opção
+  const [sizeOptions, setSizeOptions] = React.useState<SizeEntry[]>([]);
   const [selectedSize, setSelectedSize] = React.useState<SizeKey | null>(null);
-
-  // total agregado para UX (badge de estoque baixo)
-  const totalAmount = React.useMemo(() => sizes.reduce((s, e) => s + (e.amount || 0), 0), [sizes]);
 
   const [qty, setQty] = React.useState(1);
   const [adding, setAdding] = React.useState(false);
@@ -115,9 +130,7 @@ export default function ProductDetailsPage() {
   // Badge do carrinho
   const [cartCount, setCartCount] = React.useState(0);
   React.useEffect(() => {
-    // inicial
     setCartCount(countCartLS());
-    // atualiza se mudar em outra aba/janela
     function onStorage(e: StorageEvent) {
       if (e.key === CART_KEY) setCartCount(countCartLS());
     }
@@ -125,7 +138,7 @@ export default function ProductDetailsPage() {
     return () => window.removeEventListener("storage", onStorage);
   }, []);
 
-  // Carrega dados do produto + tamanhos/estoque
+  // Carrega dados do produto + imagens + tamanhos/estoque
   React.useEffect(() => {
     let ignore = false;
     (async () => {
@@ -135,7 +148,7 @@ export default function ProductDetailsPage() {
         // Produto
         const { data: prow, error: perr } = await supabase
           .from("products")
-          .select("id, title, description, price_cents, active")
+          .select("id, title, description, price_cents, active, amount")
           .eq("id", id)
           .maybeSingle();
         if (perr) throw perr;
@@ -156,65 +169,64 @@ export default function ProductDetailsPage() {
             return data.publicUrl;
           }) ?? [];
 
-        // Grupo "Tamanho" (somente ele)
-        const { data: gdata, error: gerr } = await supabase
+        // Tamanho: procura grupo "Tamanho"
+        const { data: grows, error: gerr } = await supabase
           .from("variant_groups")
-          .select("id, name")
+          .select("id, name, position")
           .eq("product_id", id)
           .eq("name", "Tamanho")
-          .limit(1);
+          .order("position", { ascending: true });
         if (gerr) throw gerr;
 
         let sizeEntries: SizeEntry[] = [];
-        if ((gdata ?? []).length > 0) {
-          const gid = (gdata![0] as { id: string }).id;
+        if ((grows ?? []).length > 0) {
+          const sizeGroupId = (grows![0] as VariantGroup).id;
 
-          // opções P/M/G/GG
-          type Opt = { id: string; value: string; variant_group_id: string };
-          const { data: odata, error: oerr } = await supabase
+          // Pega opções do grupo (value = P/M/G/GG)
+          const { data: optRows, error: optErr } = await supabase
             .from("variant_options")
-            .select("id, value, variant_group_id")
-            .eq("variant_group_id", gid)
+            .select("id, variant_group_id, value, position")
+            .eq("variant_group_id", sizeGroupId)
             .in("value", SIZE_LABELS);
-          if (oerr) throw oerr;
+          if (optErr) throw optErr;
 
-          const options = (odata ?? []) as Opt[];
+          const options = (optRows ?? []) as VariantOptionRow[];
           const optionIds = options.map((o) => o.id);
 
-          // estoques por option
+          // Estoque por option em product_variants
           type PV = { variant_option_id: string; amount: number };
-          let pvRows: PV[] = [];
-          if (optionIds.length) {
-            const { data: pv, error: pverr } = await supabase
+          let pv: PV[] = [];
+          if (optionIds.length > 0) {
+            const { data: pvData, error: pvErr } = await supabase
               .from("product_variants")
               .select("variant_option_id, amount")
               .eq("product_id", id)
               .in("variant_option_id", optionIds);
-            if (pverr) throw pverr;
-            pvRows = (pv ?? []) as PV[];
+            if (pvErr) throw pvErr;
+            pv = (pvData ?? []) as PV[];
           }
 
-          sizeEntries = options.map((o) => {
-            const key = o.value as SizeKey;
-            const found = pvRows.find((r) => r.variant_option_id === o.id);
-            return { key, optionId: o.id, amount: found?.amount ?? 0 };
-          });
-
-          // ordena na ordem P, M, G, GG
-          sizeEntries.sort((a, b) => SIZE_LABELS.indexOf(a.key) - SIZE_LABELS.indexOf(b.key));
+          sizeEntries = options
+            .map((o) => {
+              const k = o.value as SizeKey;
+              if (!SIZE_LABELS.includes(k)) return null;
+              const amt = pv.find((x) => x.variant_option_id === o.id)?.amount ?? 0;
+              return { key: k, optionId: o.id, amount: amt } as SizeEntry;
+            })
+            .filter(Boolean) as SizeEntry[];
         }
 
         if (!ignore) {
           setProduct(prow as Product);
           setImages(urls);
           setActiveImg(0);
-          setSizes(sizeEntries);
+          setSizeOptions(sizeEntries);
 
-          // pré-seleção: se só há um tamanho com estoque > 0, marca
+          // Pré-seleciona se houver exatamente 1 tamanho com estoque > 0
           const withStock = sizeEntries.filter((e) => e.amount > 0);
           setSelectedSize(withStock.length === 1 ? withStock[0].key : null);
 
-          // zera quantidade
+          // Garante quantidade inicial válida (1)
           setQty(1);
         }
       } catch (e) {
@@ -230,56 +242,109 @@ export default function ProductDetailsPage() {
     };
   }, [id, supabase]);
 
-  // Quantidade (respeita estoque da variante selecionada)
-  const selectedEntry = React.useMemo(
-    () => (selectedSize ? sizes.find((s) => s.key === selectedSize) ?? null : null),
-    [sizes, selectedSize]
-  );
-  const maxQty = selectedEntry?.amount ?? 0;
-  const isOut = totalAmount <= 0;
-  const isLow = !isOut && totalAmount < 10;
+  // estoque total e flags (para UI)
+  const totalStock = React.useMemo(() => {
+    if (!product) return 0;
+    if (sizeOptions.length > 0) {
+      return sizeOptions.reduce((s, e) => s + (e.amount || 0), 0);
+    }
+    return Number.isFinite(product.amount as number) ? (product.amount as number) : 0;
+  }, [product, sizeOptions]);
 
+  const isOut = totalStock <= 0;
+  const isLow = !isOut && totalStock < 10;
+
+  // estoque MAX para controle de +/-
+  const maxForCurrent = React.useMemo(() => {
+    if (sizeOptions.length > 0) {
+      if (!selectedSize) return 0;
+      const entry = sizeOptions.find((e) => e.key === selectedSize);
+      return entry?.amount ?? 0;
+    }
+    return Number.isFinite(product?.amount as number) ? (product?.amount as number) : 0;
+  }, [sizeOptions, selectedSize, product]);
+
+  // Quantidade (respeita estoque)
   function handleDec() {
     setQty((q) => Math.max(1, q - 1));
   }
   function handleInc() {
-    setQty((q) => Math.min(maxQty || 1, q + 1));
+    const max = Math.max(0, maxForCurrent);
+    setQty((q) => Math.min(Math.max(1, max), q + 1));
   }
 
-  // Adicionar ao carrinho (por variante)
+  // Adicionar ao carrinho: grava direto no localStorage e atualiza badge
   function handleAddToCart() {
     if (!product) return;
     if (!product.active) return;
 
-    if (sizes.length > 0 && !selectedSize) {
-      alert("Escolha um tamanho antes de adicionar.");
+    // Se tem tamanhos, garantir seleção e usar estoque da variante
+    if (sizeOptions.length > 0) {
+      if (!selectedSize) {
+        alert("Selecione um tamanho.");
+        return;
+      }
+      const entry = sizeOptions.find((e) => e.key === selectedSize);
+      if (!entry) {
+        alert("Tamanho indisponível para este produto.");
+        return;
+      }
+      if (entry.amount <= 0) {
+        alert("Este tamanho está esgotado.");
+        return;
+      }
+
+      const max = entry.amount;
+      const desired = Math.max(1, Math.min(qty, max));
+      setAdding(true);
+      try {
+        const img = images[0] || null;
+        const updated = upsertCartLS(
+          {
+            kind: "variant",                        // <— discriminante evita o erro
+            id: `${product.id}:${entry.optionId}`,
+            product_id: product.id,
+            variant_option_id: entry.optionId,
+            size: selectedSize,
+            title: product.title,
+            price_cents: product.price_cents,
+            imageUrl: img,
+            max,
+          },
+          desired,
+          max
+        );
+        writeCartLS(updated);
+        setCartCount(countCartLS());
+      } finally {
+        setAdding(false);
+      }
       return;
     }
 
-    const entry = selectedEntry;
-    if (sizes.length > 0 && (!entry || entry.amount <= 0)) {
-      alert("Este tamanho está esgotado.");
+    // Sem variações: usa amount do produto
+    const baseMax = Number.isFinite(product.amount as number) ? (product.amount as number) : 0;
+    if (baseMax <= 0) {
+      alert("Produto esgotado no momento.");
       return;
     }
 
-    const img = images[0] || null;
-    const optionId = entry!.optionId; // se chegou aqui e tem sizes, entry existe
-    const desired = Math.max(1, Math.min(qty, entry!.amount));
-
+    const desired = Math.max(1, Math.min(qty, baseMax));
     setAdding(true);
     try {
+      const img = images[0] || null;
       const updated = upsertCartLS(
         {
-          id: `${product.id}:${optionId}`,
+          kind: "simple",                         // <— discriminante
+          id: product.id,
           product_id: product.id,
-          variant_option_id: optionId,
-          size: selectedSize!, // "P" | "M" | "G" | "GG"
           title: product.title,
           price_cents: product.price_cents,
           imageUrl: img,
+          max: baseMax,
         },
         desired,
-        entry!.amount
+        baseMax
       );
       writeCartLS(updated);
       setCartCount(countCartLS());
@@ -363,7 +428,7 @@ export default function ProductDetailsPage() {
               <div className="text-base font-semibold whitespace-nowrap">{formatPrice(product.price_cents)}</div>
             </div>
 
-            {/* Estoque info (agregado) */}
+            {/* Estoque info (total) */}
             {isOut ? (
               <div className="inline-flex items-center gap-2 px-2 py-1 rounded-full text-xs text-red-700 bg-red-50 border border-red-200">
                 ESGOTADO
@@ -371,7 +436,7 @@ export default function ProductDetailsPage() {
             ) : isLow ? (
               <div className="inline-flex items-center gap-2 px-2 py-1 rounded-full text-xs text-orange-700 bg-orange-50 border border-orange-200">
                 <AlertTriangle className="w-3 h-3" />
-                Restam {totalAmount} un. (tamanhos)
+                Restam {totalStock} un.
               </div>
             ) : null}
 
@@ -384,13 +449,13 @@ export default function ProductDetailsPage() {
               )}
             </DetailsAccordion>
 
-            {/* Seleção de tamanho */}
-            {sizes.length > 0 && (
+            {/* Seletor de tamanho (se houver grupo Tamanho) */}
+            {sizeOptions.length > 0 && (
               <div>
                 <div className="text-sm font-medium mb-1">Tamanho</div>
                 <div className="flex flex-wrap gap-2">
                   {SIZE_LABELS.map((sz) => {
-                    const entry = sizes.find((e) => e.key === sz);
+                    const entry = sizeOptions.find((e) => e.key === sz);
                     const exists = Boolean(entry);
                     const hasStock = (entry?.amount ?? 0) > 0;
                     const active = selectedSize === sz;
@@ -399,7 +464,7 @@ export default function ProductDetailsPage() {
                       <button
                         key={sz}
                         type="button"
-                        disabled={!exists || !hasStock}
+                        disabled={!exists}
                         onClick={() => setSelectedSize(sz)}
                         className={`px-3 py-1.5 rounded-full border text-sm ${
                           active ? "text-white border-transparent" : "text-gray-700 border-gray-200 bg-gray-50"
@@ -418,28 +483,35 @@ export default function ProductDetailsPage() {
                     );
                   })}
                 </div>
+
+                {/* Estoque do tamanho selecionado (se aplicável) */}
+                {selectedSize && (
+                  <div className="text-xs text-gray-600 mt-1">
+                    Estoque do tamanho {selectedSize}:{" "}
+                    {sizeOptions.find((e) => e.key === selectedSize)?.amount ?? 0}
+                  </div>
+                )}
               </div>
             )}
 
             {/* Quantidade e CTA */}
             <div className="flex items-center gap-3">
               <div className="inline-flex items-center gap-2 border border-gray-200 rounded-xl p-1">
-                <button onClick={handleDec} className="w-8 h-8 grid place-items-center" disabled={isOut || !selectedEntry}>
+                <button onClick={handleDec} className="w-8 h-8 grid place-items-center" disabled={isOut}>
                   -
                 </button>
                 <span className="w-8 text-center select-none">{qty}</span>
                 <button
                   onClick={handleInc}
                   className="w-8 h-8 grid place-items-center"
-                  disabled={isOut || !selectedEntry || qty >= (selectedEntry?.amount ?? 1)}
-                  title={selectedEntry ? `Máx: ${selectedEntry.amount}` : undefined}
+                  disabled={isOut || qty >= Math.max(0, maxForCurrent)}
                 >
                   +
                 </button>
               </div>
               <button
                 onClick={handleAddToCart}
-                disabled={!product.active || adding || isOut || (sizes.length > 0 && !selectedSize)}
+                disabled={!product.active || adding || isOut || (sizeOptions.length > 0 && !selectedSize)}
                 className="flex-1 px-3 py-3 rounded-xl text-white disabled:opacity-50"
                 style={{ backgroundColor: ACCENT }}
               >

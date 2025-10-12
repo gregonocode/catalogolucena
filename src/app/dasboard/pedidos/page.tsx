@@ -32,11 +32,14 @@ type OrderRow = {
 };
 
 type ProductLite = { id: string; title: string };
+
 type RawOrderItemRow = {
   id: number;
   order_id: number;
   quantity: number;
   price_cents: number;
+  size_label: string | null;           // <-- novo (mostrar na UI)
+  variant_option_id: string | null;    // <-- novo (para referência)
   product: ProductLite | ProductLite[] | null;
 };
 
@@ -45,6 +48,8 @@ type OrderItemRow = {
   order_id: number;
   quantity: number;
   price_cents: number;
+  size_label: string | null;
+  variant_option_id: string | null;
   product: ProductLite | null;
 };
 
@@ -52,8 +57,13 @@ type ProductPick = {
   id: string;
   title: string;
   price_cents: number;
-  amount: number | null; // estoque atual (para avisos)
+  amount: number | null; // estoque atual do produto (para produtos sem variação)
 };
+
+type SizeKey = "P" | "M" | "G" | "GG";
+const SIZE_LABELS: SizeKey[] = ["P", "M", "G", "GG"];
+
+type VariantPick = { optionId: string; label: SizeKey; amount: number };
 
 function formatBRL(cents: number) {
   const v = (cents || 0) / 100;
@@ -82,6 +92,10 @@ export default function OrdersPage() {
   const [selectedProductByOrder, setSelectedProductByOrder] = React.useState<Record<number, ProductPick | null>>({});
   const [qtyByOrder, setQtyByOrder] = React.useState<Record<number, number>>({});
   const [addingItemByOrder, setAddingItemByOrder] = React.useState<Record<number, boolean>>({});
+
+  // variantes por pedido (quando seleciona um produto com "Tamanho")
+  const [variantsByOrder, setVariantsByOrder] = React.useState<Record<number, VariantPick[]>>({});
+  const [selectedVariantByOrder, setSelectedVariantByOrder] = React.useState<Record<number, VariantPick | null>>({});
 
   const totalPages = React.useMemo(
     () => Math.max(1, Math.ceil(total / PAGE_SIZE)),
@@ -130,7 +144,7 @@ export default function OrdersPage() {
       setExpanding((m) => ({ ...m, [orderId]: true }));
       const { data, error } = await supabase
         .from("order_items")
-        .select("id, order_id, quantity, price_cents, product:products(id, title)")
+        .select("id, order_id, quantity, price_cents, size_label, variant_option_id, product:products(id, title)")
         .eq("order_id", orderId)
         .order("id", { ascending: true });
       if (error) throw error;
@@ -149,6 +163,8 @@ export default function OrdersPage() {
           order_id: row.order_id,
           quantity: row.quantity,
           price_cents: row.price_cents,
+          size_label: row.size_label ?? null,
+          variant_option_id: row.variant_option_id ?? null,
           product,
         };
       });
@@ -159,6 +175,8 @@ export default function OrdersPage() {
       setSelectedProductByOrder((prev) => ({ ...prev, [orderId]: prev[orderId] ?? null }));
       setProductSearchByOrder((prev) => ({ ...prev, [orderId]: prev[orderId] ?? "" }));
       setProductResultsByOrder((prev) => ({ ...prev, [orderId]: prev[orderId] ?? [] }));
+      setVariantsByOrder((prev) => ({ ...prev, [orderId]: prev[orderId] ?? [] }));
+      setSelectedVariantByOrder((prev) => ({ ...prev, [orderId]: prev[orderId] ?? null }));
     } catch (e) {
       setErr(e instanceof Error ? e.message : "Erro ao carregar itens do pedido");
     } finally {
@@ -257,10 +275,74 @@ export default function OrdersPage() {
     }
   }
 
+  // Quando o operador escolhe um produto da lista, buscamos as variantes de TAMANHO (se houver)
+  async function onSelectProduct(orderId: number, product: ProductPick) {
+    setSelectedProductByOrder((prev) => ({ ...prev, [orderId]: product }));
+    setSelectedVariantByOrder((prev) => ({ ...prev, [orderId]: null }));
+    setVariantsByOrder((prev) => ({ ...prev, [orderId]: [] }));
+
+    try {
+      // 1) existem grupos "Tamanho"?
+      const { data: groups, error: gErr } = await supabase
+        .from("variant_groups")
+        .select("id, name")
+        .eq("product_id", product.id)
+        .eq("name", "Tamanho")
+        .limit(1);
+      if (gErr) throw gErr;
+
+      if (!groups || groups.length === 0) {
+        // produto sem variação de tamanho
+        setVariantsByOrder((prev) => ({ ...prev, [orderId]: [] }));
+        return;
+      }
+
+      const groupId = groups[0].id;
+
+      // 2) pegar opções P/M/G/GG
+      const { data: options, error: oErr } = await supabase
+        .from("variant_options")
+        .select("id, value")
+        .eq("variant_group_id", groupId)
+        .in("value", SIZE_LABELS);
+      if (oErr) throw oErr;
+
+      const optionIds = (options ?? []).map((o) => o.id);
+      if (optionIds.length === 0) {
+        setVariantsByOrder((prev) => ({ ...prev, [orderId]: [] }));
+        return;
+      }
+
+      // 3) estoque de cada opção em product_variants
+      const { data: pvr, error: pvErr } = await supabase
+        .from("product_variants")
+        .select("variant_option_id, amount")
+        .eq("product_id", product.id)
+        .in("variant_option_id", optionIds);
+      if (pvErr) throw pvErr;
+
+      const amounts = new Map<string, number>((pvr ?? []).map((r: any) => [r.variant_option_id, r.amount as number]));
+      const variants: VariantPick[] = (options ?? [])
+        .map((o) => ({
+          optionId: o.id as string,
+          label: (o.value as SizeKey) as SizeKey,
+          amount: amounts.get(o.id as string) ?? 0,
+        }))
+        .sort((a, b) => SIZE_LABELS.indexOf(a.label) - SIZE_LABELS.indexOf(b.label));
+
+      setVariantsByOrder((prev) => ({ ...prev, [orderId]: variants }));
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Erro ao carregar tamanhos do produto");
+    }
+  }
+
   // Adicionar item selecionado ao pedido (somente pendente)
   async function addItemToOrder(order: OrderRow) {
     const selected = selectedProductByOrder[order.id];
     const qty = Math.max(1, qtyByOrder[order.id] ?? 1);
+    const variants = variantsByOrder[order.id] ?? [];
+    const selectedVariant = selectedVariantByOrder[order.id] ?? null;
+
     if (!selected) {
       setErr("Selecione um produto");
       return;
@@ -269,13 +351,18 @@ export default function OrdersPage() {
       setErr("Apenas pedidos pendentes podem receber itens.");
       return;
     }
+    // se o produto possui tamanhos, exigir seleção de tamanho
+    if (variants.length > 0 && !selectedVariant) {
+      setErr("Selecione um tamanho para este produto.");
+      return;
+    }
 
     try {
       setErr(null);
       setOk(null);
       setAddingItemByOrder((m) => ({ ...m, [order.id]: true }));
 
-      // Segurança: pega preço atual do produto (evita manipulação do cliente)
+      // Segurança: pega preço atual do produto
       const { data: prod, error: pErr } = await supabase
         .from("products")
         .select("id, title, price_cents, amount")
@@ -284,22 +371,36 @@ export default function OrdersPage() {
       if (pErr) throw pErr;
       if (!prod) throw new Error("Produto não encontrado");
 
-      // (Opcional) aviso de estoque baixo/zerado — não bloqueia
-      if ((prod.amount ?? 0) <= 0) {
-        // segue adicionando; consumo real é na aprovação
-        console.warn("Produto com estoque zerado — será possível aprovar apenas se houver ajuste de estoque.");
+      // (Avisos) estoque: se tem variante, considerar amount da variante; se não, amount do produto
+      if (variants.length > 0 && selectedVariant) {
+        if (selectedVariant.amount <= 0) {
+          console.warn("Variante esgotada — será possível aprovar apenas se houver ajuste de estoque.");
+        }
+      } else if ((prod.amount ?? 0) <= 0) {
+        console.warn("Produto sem variação esgotado — será possível aprovar apenas se houver ajuste de estoque.");
       }
 
-      // Insere o item com preço do momento
-      const insertPayload = {
-        order_id: order.id,
-        product_id: prod.id,
-        quantity: qty,
-        price_cents: prod.price_cents,
-      };
+      // Monta payload com/sem variante
+      const insertPayload =
+        variants.length > 0 && selectedVariant
+          ? {
+              order_id: order.id,
+              product_id: prod.id,
+              quantity: qty,
+              price_cents: prod.price_cents,
+              variant_option_id: selectedVariant.optionId,
+              size_label: selectedVariant.label,
+            }
+          : {
+              order_id: order.id,
+              product_id: prod.id,
+              quantity: qty,
+              price_cents: prod.price_cents,
+            };
+
       const { data: inserted, error: iErr } = await supabase
         .from("order_items")
-        .insert(insertPayload)
+        .insert(insertPayload as any)
         .select("id")
         .single<{ id: number }>();
       if (iErr) throw iErr;
@@ -311,13 +412,15 @@ export default function OrdersPage() {
         quantity: qty,
         price_cents: prod.price_cents,
         product: { id: prod.id, title: prod.title },
+        size_label: (insertPayload as any).size_label ?? null,
+        variant_option_id: (insertPayload as any).variant_option_id ?? null,
       };
       setItemsByOrder((prev) => {
         const current = prev[order.id] ?? [];
         return { ...prev, [order.id]: [...current, newItem] };
       });
 
-      // Atualiza total otimista (trigger também recalcula no BD)
+      // Atualiza total otimista
       const delta = prod.price_cents * qty;
       setRows((prev) =>
         prev.map((r) => (r.id === order.id ? { ...r, total_cents: (r.total_cents || 0) + delta } : r))
@@ -326,6 +429,8 @@ export default function OrdersPage() {
       // Reseta seleção/quantidade
       setSelectedProductByOrder((prev) => ({ ...prev, [order.id]: null }));
       setQtyByOrder((prev) => ({ ...prev, [order.id]: 1 }));
+      setVariantsByOrder((prev) => ({ ...prev, [order.id]: [] }));
+      setSelectedVariantByOrder((prev) => ({ ...prev, [order.id]: null }));
       setOk("Item adicionado ao pedido!");
     } catch (e) {
       setErr(e instanceof Error ? e.message : "Erro ao adicionar item ao pedido");
@@ -422,9 +527,13 @@ export default function OrdersPage() {
               const selected = selectedProductByOrder[r.id] ?? null;
               const qty = Math.max(1, qtyByOrder[r.id] ?? 1);
 
-              const lowStock =
+              // variantes carregadas para o produto selecionado
+              const variants = variantsByOrder[r.id] ?? [];
+              const selectedVariant = selectedVariantByOrder[r.id] ?? null;
+
+              const lowStockProduct =
                 selected && typeof selected.amount === "number" && selected.amount > 0 && selected.amount < 10;
-              const outStock = selected && (selected.amount ?? 0) <= 0;
+              const outStockProduct = selected && (selected.amount ?? 0) <= 0;
 
               return (
                 <li key={r.id} className="px-3 py-3">
@@ -507,6 +616,9 @@ export default function OrdersPage() {
                                       {it.product?.title ?? (
                                         <span className="text-gray-500">Produto removido</span>
                                       )}
+                                      {it.size_label ? (
+                                        <span className="ml-2 text-xs text-gray-600">• Tam: <b>{it.size_label}</b></span>
+                                      ) : null}
                                     </span>
                                     <button
                                       type="button"
@@ -536,7 +648,7 @@ export default function OrdersPage() {
                               Adicionar item ao pedido
                             </div>
 
-                            <div className="flex flex-col md:flex-row gap-2 md:items-end">
+                            <div className="flex flex-col md:flex-row md:items-end gap-3">
                               {/* Buscar produto */}
                               <div className="flex-1">
                                 <label className="text-xs text-gray-600">Buscar produto</label>
@@ -575,9 +687,7 @@ export default function OrdersPage() {
                                             key={p.id}
                                             className={`px-3 py-2 text-sm cursor-pointer flex items-center justify-between
                                               ${isSelected ? "bg-emerald-50" : "hover:bg-gray-50"}`}
-                                            onClick={() =>
-                                              setSelectedProductByOrder((prev) => ({ ...prev, [r.id]: p }))
-                                            }
+                                            onClick={() => onSelectProduct(r.id, p)}
                                           >
                                             <span className="truncate">{p.title}</span>
                                             <span className="ml-2 text-xs text-gray-600">
@@ -599,6 +709,36 @@ export default function OrdersPage() {
                                   </div>
                                 )}
                               </div>
+
+                              {/* Se tiver tamanhos, mostra seletor */}
+                              {variants.length > 0 && (
+                                <div className="w-full md:w-56">
+                                  <label className="text-xs text-gray-600">Tamanho</label>
+                                  <div className="flex flex-wrap gap-1.5">
+                                    {variants.map((v) => {
+                                      const active = selectedVariant?.optionId === v.optionId;
+                                      const hasStock = v.amount > 0;
+                                      return (
+                                        <button
+                                          key={v.optionId}
+                                          type="button"
+                                          onClick={() => setSelectedVariantByOrder((prev) => ({ ...prev, [r.id]: v }))}
+                                          disabled={!hasStock}
+                                          className={`px-2.5 py-1 rounded-full border text-xs ${
+                                            active
+                                              ? "text-white border-transparent"
+                                              : "text-gray-700 border-gray-200 bg-gray-50"
+                                          } disabled:opacity-40 disabled:cursor-not-allowed`}
+                                          style={active ? { backgroundColor: ACCENT } : {}}
+                                          title={hasStock ? `Disponível: ${v.amount} un.` : "Esgotado"}
+                                        >
+                                          {v.label}
+                                        </button>
+                                      );
+                                    })}
+                                  </div>
+                                </div>
+                              )}
 
                               {/* Quantidade */}
                               <div className="w-full md:w-40">
@@ -622,7 +762,7 @@ export default function OrdersPage() {
                                 <button
                                   type="button"
                                   onClick={() => addItemToOrder(r)}
-                                  disabled={!canMutate || !selected || adding}
+                                  disabled={!canMutate || !selected || (variants.length > 0 && !selectedVariant) || adding}
                                   className="w-full md:w-auto inline-flex items-center gap-2 px-4 py-2 rounded-xl text-white disabled:opacity-50"
                                   style={{ backgroundColor: ACCENT }}
                                 >
@@ -633,15 +773,21 @@ export default function OrdersPage() {
                                   )}
                                   Adicionar
                                 </button>
+
                                 {/* Avisos de estoque (não bloqueiam) */}
-                                {selected && outStock && (
+                                {selected && variants.length === 0 && outStockProduct && (
                                   <div className="mt-1 text-[11px] text-red-700">
                                     Produto esgotado — ajuste o estoque antes de aprovar.
                                   </div>
                                 )}
-                                {selected && lowStock && !outStock && (
+                                {selected && variants.length === 0 && lowStockProduct && !outStockProduct && (
                                   <div className="mt-1 text-[11px] text-orange-700">
                                     Estoque baixo ({selected.amount} un.) — verifique antes de aprovar.
+                                  </div>
+                                )}
+                                {selected && variants.length > 0 && selectedVariant && selectedVariant.amount <= 10 && (
+                                  <div className="mt-1 text-[11px] text-orange-700">
+                                    Estoque do tamanho {selectedVariant.label}: {selectedVariant.amount} un.
                                   </div>
                                 )}
                               </div>

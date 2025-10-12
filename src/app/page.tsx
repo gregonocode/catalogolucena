@@ -8,25 +8,26 @@ import Link from "next/link";
 // Accent color
 const ACCENT = "#01A920";
 
+/* ===================== Tipos ===================== */
 type Category = { id: string; name: string; slug: string };
 
-// Produto básico (sem estoque agregado)
 type ProductRow = {
   id: string;
   title: string;
   price_cents: number;
+  amount: number | null; // estoque do produto (fallback para sem variante)
   product_images: { storage_path: string; is_primary: boolean }[] | null;
   product_categories: { category_id: string }[] | null;
 };
 
-// Card com total de estoque (soma das variantes)
 type ProductCard = {
   id: string;
   title: string;
   price_cents: number;
   imageUrl: string | null;
   categoryIds: string[];
-  totalAmount: number; // soma dos amounts das variantes
+  baseAmount: number;  // products.amount (para produtos sem variação)
+  totalAmount: number; // soma das variantes ou baseAmount
 };
 
 type SizeKey = "P" | "M" | "G" | "GG";
@@ -34,8 +35,9 @@ const SIZE_LABELS: SizeKey[] = ["P", "M", "G", "GG"];
 
 type SizeEntry = { key: SizeKey; optionId: string; amount: number };
 
-// Item do carrinho agora é por produto + tamanho
-type CartItem = {
+/** União discriminada para o carrinho */
+type CartItemVariant = {
+  kind: "variant";
   id: string; // `${product_id}:${variant_option_id}`
   product_id: string;
   variant_option_id: string;
@@ -46,6 +48,17 @@ type CartItem = {
   qty: number;
   max?: number; // estoque da variante
 };
+type CartItemSimple = {
+  kind: "simple";
+  id: string; // `${product_id}`
+  product_id: string;
+  title: string;
+  price_cents: number;
+  imageUrl: string | null;
+  qty: number;
+  max?: number; // estoque do produto (sem variação)
+};
+type CartItem = CartItemVariant | CartItemSimple;
 
 type StoreSettings = {
   id: string;
@@ -53,6 +66,9 @@ type StoreSettings = {
   whatsapp_e164: string | null;
   link_banner: string | null;
 };
+
+/* ===================== Utils ===================== */
+const CART_KEY = "cart_v2_sizes";
 
 function formatPrice(cents: number) {
   return (cents / 100).toLocaleString("pt-BR", {
@@ -62,6 +78,29 @@ function formatPrice(cents: number) {
   });
 }
 
+function normalizePhoneForWa(me: string | null): string | null {
+  if (!me) return null;
+  const digits = me.replace(/\D/g, "");
+  if (!digits) return null;
+  return digits.startsWith("55") ? digits : `55${digits}`;
+}
+
+/* LS helpers */
+function readCartLS(): CartItem[] {
+  try {
+    const raw = localStorage.getItem(CART_KEY);
+    return raw ? (JSON.parse(raw) as CartItem[]) : [];
+  } catch {
+    return [];
+  }
+}
+function writeCartLS(items: CartItem[]) {
+  try {
+    localStorage.setItem(CART_KEY, JSON.stringify(items));
+  } catch {}
+}
+
+/* ===================== Página ===================== */
 export default function Page() {
   const supabase = supabaseBrowser();
 
@@ -91,13 +130,13 @@ export default function Page() {
 
   React.useEffect(() => {
     try {
-      const raw = localStorage.getItem("cart_v2_sizes");
+      const raw = localStorage.getItem(CART_KEY);
       if (raw) setCart(JSON.parse(raw));
     } catch {}
   }, []);
   React.useEffect(() => {
     try {
-      localStorage.setItem("cart_v2_sizes", JSON.stringify(cart));
+      localStorage.setItem(CART_KEY, JSON.stringify(cart));
     } catch {}
   }, [cart]);
 
@@ -105,14 +144,120 @@ export default function Page() {
   function orderCode(id: number) {
     return `#${String(id).padStart(5, "0")}`;
   }
-  function normalizePhoneForWa(me: string | null): string | null {
-    if (!me) return null;
-    const digits = me.replace(/\D/g, "");
-    if (!digits) return null;
-    return digits.startsWith("55") ? digits : `55${digits}`;
+
+  // Carrinho com respeito ao estoque (variante ou produto)
+  function addToCart(p: ProductCard) {
+    const sizes = sizesByProduct[p.id] ?? [];
+    // Se tem variações, exigir seleção
+    if (sizes.length > 0) {
+      const sel = selectedSize[p.id] ?? null;
+      if (!sel) {
+        alert("Escolha um tamanho antes de adicionar.");
+        return;
+      }
+      const entry = sizes.find((s) => s.key === sel);
+      if (!entry) {
+        alert("Tamanho indisponível para este produto.");
+        return;
+      }
+      if (entry.amount <= 0) {
+        alert("Este tamanho está esgotado.");
+        return;
+      }
+
+      const itemId = `${p.id}:${entry.optionId}`;
+      const max = entry.amount;
+
+      setCart((c) => {
+        const i = c.findIndex((x) => x.id === itemId);
+        if (i >= 0) {
+          const next = [...c];
+          const currentQty = next[i].qty;
+          const nextQty = Math.min(currentQty + 1, max);
+          next[i] = { ...next[i], qty: nextQty, max } as CartItem;
+          return next;
+        }
+        const newItem: CartItemVariant = {
+          kind: "variant",
+          id: itemId,
+          product_id: p.id,
+          variant_option_id: entry.optionId,
+          size: sel,
+          title: p.title,
+          price_cents: p.price_cents,
+          imageUrl: p.imageUrl,
+          qty: 1,
+          max,
+        };
+        return [...c, newItem];
+      });
+      return;
+    }
+
+    // Sem variações: usa baseAmount
+    if (p.baseAmount <= 0) return;
+    setCart((c) => {
+      const i = c.findIndex((x) => x.id === p.id);
+      if (i >= 0) {
+        const next = [...c];
+        const currentQty = next[i].qty;
+        const nextQty = Math.min(currentQty + 1, p.baseAmount);
+        next[i] = { ...next[i], qty: nextQty, max: p.baseAmount } as CartItem;
+        return next;
+      }
+      const newItem: CartItemSimple = {
+        kind: "simple",
+        id: p.id,
+        product_id: p.id,
+        title: p.title,
+        price_cents: p.price_cents,
+        imageUrl: p.imageUrl,
+        qty: 1,
+        max: p.baseAmount,
+      };
+      return [...c, newItem];
+    });
   }
 
-  // ===== Carregar categorias, produtos, tamanhos/estoque e settings =====
+  function inc(itemId: string) {
+    setCart((c) =>
+      c.map((it) => {
+        if (it.id !== itemId) return it;
+        if (it.kind === "variant") {
+          const list = sizesByProduct[it.product_id] ?? [];
+          const currentVar = list.find((s) => s.optionId === it.variant_option_id);
+          const max = currentVar?.amount ?? it.max ?? it.qty;
+          return { ...it, qty: Math.min(it.qty + 1, max), max } as CartItemVariant;
+        }
+        const prod = products.find((p) => p.id === it.product_id);
+        const max = prod?.baseAmount ?? it.max ?? it.qty;
+        return { ...it, qty: Math.min(it.qty + 1, max), max } as CartItemSimple;
+      })
+    );
+  }
+
+  function dec(itemId: string) {
+    setCart((c) =>
+      c.flatMap((it) => {
+        if (it.id !== itemId) return [it];
+        const q = it.qty - 1;
+        return q <= 0 ? [] : [{ ...it, qty: q } as CartItem];
+      })
+    );
+  }
+
+  function removeItem(itemId: string) {
+    setCart((c) => c.filter((it) => it.id !== itemId));
+  }
+
+  function clearCart() {
+    setCart([]);
+  }
+
+  const cartCount = cart.reduce((sum, it) => sum + it.qty, 0);
+  const cartTotal = cart.reduce((sum, it) => sum + it.price_cents * it.qty, 0);
+
+  // Carregar categorias + produtos + store_settings + variantes/estoque
   React.useEffect(() => {
     let ignore = false;
     (async () => {
@@ -127,7 +272,7 @@ export default function Page() {
       const prodsPromise = supabase
         .from("products")
         .select(
-          `id, title, price_cents,
+          `id, title, price_cents, amount,
            product_images(storage_path, is_primary),
            product_categories(category_id)`
         )
@@ -178,13 +323,15 @@ export default function Page() {
           imageUrl = data.publicUrl;
         }
         const categoryIds = (p.product_categories || []).map((pc) => pc.category_id);
+        const baseAmount = Number.isFinite(p.amount as number) ? (p.amount as number) : 0;
         return {
           id: p.id,
           title: p.title,
           price_cents: p.price_cents,
           imageUrl,
           categoryIds,
-          totalAmount: 0, // vamos calcular após buscar as variantes
+          baseAmount,
+          totalAmount: baseAmount, // vamos recalcular com variantes abaixo
         };
       });
 
@@ -251,7 +398,7 @@ export default function Page() {
         for (const o of optionsData) {
           const pId = groupById.get(o.variant_group_id);
           if (!pId) continue;
-          const sizeKey = (o.value as SizeKey);
+          const sizeKey = o.value as SizeKey;
           const amount = pvRows.find((r) => r.product_id === pId && r.variant_option_id === o.id)?.amount ?? 0;
           const arr = sizesMap[pId] ?? [];
           arr.push({ key: sizeKey, optionId: o.id, amount });
@@ -259,10 +406,16 @@ export default function Page() {
           totals[pId] = (totals[pId] ?? 0) + amount;
         }
 
-        // atualizar estados
         setSizesByProduct(sizesMap);
         setProducts((prev) =>
-          prev.map((p) => ({ ...p, totalAmount: totals[p.id] ?? 0 }))
+          prev.map((p) => {
+            const totalByVariants = totals[p.id];
+            return {
+              ...p,
+              totalAmount:
+                typeof totalByVariants === "number" ? totalByVariants : p.baseAmount,
+            };
+          })
         );
 
         // pré-seleção: se só há um tamanho com estoque > 0, seleciona
@@ -300,87 +453,6 @@ export default function Page() {
     return products.filter((p) => p.categoryIds.includes(activeCat));
   }, [products, activeCat]);
 
-  // ===== Carrinho com respeito ao estoque por variante =====
-  function addToCart(product: ProductCard) {
-    const sizes = sizesByProduct[product.id] ?? [];
-    const sel = selectedSize[product.id] ?? null;
-    if (!sel) {
-      alert("Escolha um tamanho antes de adicionar.");
-      return;
-    }
-    const entry = sizes.find((s) => s.key === sel);
-    if (!entry) {
-      alert("Tamanho indisponível para este produto.");
-      return;
-    }
-    if (entry.amount <= 0) {
-      alert("Este tamanho está esgotado.");
-      return;
-    }
-
-   const itemId = `${product.id}:${entry.optionId}`;
-    const max = entry.amount;
-
-    setCart((c) => {
-      const i = c.findIndex((x) => x.id === itemId);
-      if (i >= 0) {
-        const next = [...c];
-        const currentQty = next[i].qty;
-        const nextQty = Math.min(currentQty + 1, max);
-        next[i] = { ...next[i], qty: nextQty, max };
-        return next;
-      }
-      return [
-        ...c,
-        {
-          id: itemId,
-          product_id: product.id,
-          variant_option_id: entry.optionId,
-          size: sel,
-          title: product.title,
-          price_cents: product.price_cents,
-          imageUrl: product.imageUrl,
-          qty: 1,
-          max,
-        },
-      ];
-    });
-  }
-
-  function inc(itemId: string) {
-    setCart((c) =>
-      c.map((it) => {
-        if (it.id !== itemId) return it;
-        // pega estoque atual da variante
-        const sizes = sizesByProduct[it.product_id] ?? [];
-        const currentVar = sizes.find((s) => s.optionId === it.variant_option_id);
-        const max = currentVar?.amount ?? it.max ?? it.qty;
-        return { ...it, qty: Math.min(it.qty + 1, max), max };
-      })
-    );
-  }
-
-  function dec(itemId: string) {
-    setCart((c) =>
-      c.flatMap((it) => {
-        if (it.id !== itemId) return [it];
-        const q = it.qty - 1;
-        return q <= 0 ? [] : [{ ...it, qty: q }];
-      })
-    );
-  }
-
-  function removeItem(itemId: string) {
-    setCart((c) => c.filter((it) => it.id !== itemId));
-  }
-
-  function clearCart() {
-    setCart([]);
-  }
-
-  const cartCount = cart.reduce((sum, it) => sum + it.qty, 0);
-  const cartTotal = cart.reduce((sum, it) => sum + it.price_cents * it.qty, 0);
-
   // ====== Checkout: cria pedido pendente + redireciona ======
   function buildWhatsappText(orderId: number): string {
     const lines: string[] = [];
@@ -388,11 +460,11 @@ export default function Page() {
     lines.push("");
     lines.push("Itens:");
     cart.forEach((it) => {
-      lines.push(
-        `• ${it.qty} x ${it.title} — Tam: ${it.size} — ${formatPrice(it.price_cents)} = ${formatPrice(
-          it.price_cents * it.qty
-        )}`
-      );
+      const base = `• ${it.qty} x ${it.title}`;
+      const size = it.kind === "variant" ? ` — Tam: ${it.size}` : "";
+      const unit = formatPrice(it.price_cents);
+      const total = formatPrice(it.price_cents * it.qty);
+      lines.push(`${base}${size} — ${unit} = ${total}`);
     });
     lines.push("");
     lines.push(`*Total:* ${formatPrice(cartTotal)}`);
@@ -410,15 +482,25 @@ export default function Page() {
       .single<{ id: number }>();
     if (orderErr) throw orderErr;
 
-    // insere itens com variante
-    const itemsPayload = cart.map((it) => ({
-      order_id: order.id,
-      product_id: it.product_id,
-      variant_option_id: it.variant_option_id, // <-- garantir coluna no schema
-      size_label: it.size,                     // <-- opcional: guardar label
-      quantity: it.qty,
-      price_cents: it.price_cents,
-    }));
+    // insere itens (com ou sem variante)
+    const itemsPayload = cart.map((it) => {
+      if (it.kind === "variant") {
+        return {
+          order_id: order.id,
+          product_id: it.product_id,
+          variant_option_id: it.variant_option_id,
+          size_label: it.size,
+          quantity: it.qty,
+          price_cents: it.price_cents,
+        };
+      }
+      return {
+        order_id: order.id,
+        product_id: it.product_id,
+        quantity: it.qty,
+        price_cents: it.price_cents,
+      };
+    });
     const { error: itemsErr } = await supabase.from("order_items").insert(itemsPayload);
     if (itemsErr) throw itemsErr;
 
@@ -428,33 +510,68 @@ export default function Page() {
   async function handleCheckout() {
     if (cart.length === 0 || submitting) return;
 
-    // valida estoque atual vs carrinho por VARIANTE
-    const variantIds = cart.map((c) => c.variant_option_id);
-    type FreshPV = { variant_option_id: string; amount: number };
-    const { data: fresh, error: freshErr } = await supabase
-      .from("product_variants")
-      .select("variant_option_id, amount")
-      .in("variant_option_id", variantIds);
-    if (freshErr) {
-      alert("Erro ao validar estoque. Tente novamente.");
-      return;
-    }
+    // separa itens com/sem variante
+    const withVariant = cart.filter((c): c is CartItemVariant => c.kind === "variant");
+    const noVariant = cart.filter((c): c is CartItemSimple => c.kind === "simple");
 
-    const stockMap = new Map<string, number>(
-      ((fresh ?? []) as FreshPV[]).map((r) => [r.variant_option_id, r.amount])
-    );
-
-    for (const it of cart) {
-      const available = stockMap.get(it.variant_option_id) ?? 0;
-      if (available <= 0) {
-        alert(`"${it.title}" (${it.size}) está esgotado. Remova do carrinho para continuar.`);
+    // valida VARIANTES via product_variants
+    let stockMapVariant = new Map<string, number>();
+    if (withVariant.length) {
+      const variantIds = withVariant.map((c) => c.variant_option_id);
+      type FreshPV = { variant_option_id: string; amount: number };
+      const { data: fresh, error: freshErr } = await supabase
+        .from("product_variants")
+        .select("variant_option_id, amount")
+        .in("variant_option_id", variantIds);
+      if (freshErr) {
+        alert("Erro ao validar estoque. Tente novamente.");
         return;
       }
-      if (it.qty > available) {
-        alert(
-          `Quantidade de "${it.title}" (${it.size}) excede o estoque (${available}). Ajuste o carrinho.`
-        );
+      stockMapVariant = new Map<string, number>(
+        ((fresh ?? []) as FreshPV[]).map((r) => [r.variant_option_id, r.amount])
+      );
+    }
+
+    // valida ITENS SEM VARIANTE via products.amount
+    let stockMapProduct = new Map<string, number>();
+    if (noVariant.length) {
+      const prodIds = noVariant.map((c) => c.product_id);
+      type FreshProd = { id: string; amount: number };
+      const { data: freshP, error: freshPErr } = await supabase
+        .from("products")
+        .select("id, amount")
+        .in("id", prodIds);
+      if (freshPErr) {
+        alert("Erro ao validar estoque. Tente novamente.");
         return;
+      }
+      stockMapProduct = new Map<string, number>(
+        ((freshP ?? []) as FreshProd[]).map((r) => [r.id, r.amount])
+      );
+    }
+
+    // checagem final
+    for (const it of cart) {
+      if (it.kind === "variant") {
+        const available = stockMapVariant.get(it.variant_option_id) ?? 0;
+        if (available <= 0) {
+          alert(`"${it.title}" (${it.size}) está esgotado. Remova do carrinho para continuar.`);
+          return;
+        }
+        if (it.qty > available) {
+          alert(`Quantidade de "${it.title}" excede o estoque da variante (${available}). Ajuste o carrinho.`);
+          return;
+        }
+      } else {
+        const available = stockMapProduct.get(it.product_id) ?? 0;
+        if (available <= 0) {
+          alert(`"${it.title}" está esgotado. Remova do carrinho para continuar.`);
+          return;
+        }
+        if (it.qty > available) {
+          alert(`Quantidade de "${it.title}" excede o estoque (${available}). Ajuste o carrinho.`);
+          return;
+        }
       }
     }
 
@@ -628,14 +745,10 @@ export default function Page() {
                             <button
                               key={sz}
                               type="button"
-                              disabled={!exists || !hasStock}
-                              onClick={() =>
-                                setSelectedSize((prev) => ({ ...prev, [p.id]: sz }))
-                              }
+                              disabled={!exists}
+                              onClick={() => setSelectedSize((prev) => ({ ...prev, [p.id]: sz }))}
                               className={`px-2.5 py-1 rounded-full border text-xs ${
-                                active
-                                  ? "text-white border-transparent"
-                                  : "text-gray-700 border-gray-200 bg-gray-50"
+                                active ? "text-white border-transparent" : "text-gray-700 border-gray-200 bg-gray-50"
                               } disabled:opacity-40 disabled:cursor-not-allowed`}
                               style={active ? { backgroundColor: ACCENT } : {}}
                               title={
@@ -712,13 +825,20 @@ export default function Page() {
                 </div>
               ) : (
                 cart.map((it) => {
-                  // estoque atual da variante (caso tenha mudado)
-                  const varEntry =
-                    (sizesByProduct[it.product_id] ?? []).find(
-                      (e) => e.optionId === it.variant_option_id
-                    ) || null;
-                  const max = varEntry?.amount ?? it.max;
-                  const atMax = typeof max === "number" && it.qty >= max;
+                  // estoque atual da linha
+                  let max: number | undefined;
+                  let atMax = false;
+
+                  if (it.kind === "variant") {
+                    const varEntry =
+                      (sizesByProduct[it.product_id] ?? []).find((e) => e.optionId === it.variant_option_id) || null;
+                    max = varEntry?.amount ?? it.max;
+                    atMax = typeof max === "number" && it.qty >= max;
+                  } else {
+                    const prod = products.find((p) => p.id === it.product_id);
+                    max = prod?.baseAmount ?? it.max;
+                    atMax = typeof max === "number" && it.qty >= max;
+                  }
 
                   return (
                     <div key={it.id} className="flex items-center gap-3 p-2 rounded-xl border border-gray-100 bg-white shadow-sm">
@@ -733,7 +853,13 @@ export default function Page() {
                       <div className="flex-1 min-w-0">
                         <div className="text-sm font-medium truncate">{it.title}</div>
                         <div className="text-xs text-gray-500">
-                          {formatPrice(it.price_cents)} • Tam: <b>{it.size}</b>
+                          {formatPrice(it.price_cents)}
+                          {it.kind === "variant" ? (
+                            <>
+                              {" "}
+                              • Tam: <b>{it.size}</b>
+                            </>
+                          ) : null}
                         </div>
                         <div className="mt-1 inline-flex items-center gap-2">
                           <button

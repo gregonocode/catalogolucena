@@ -3,44 +3,44 @@
 import React from "react";
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
-import {
-  ArrowLeft,
-  ShoppingCart,
-  Loader2,
-  ChevronDown,
-  ChevronUp,
-  AlertTriangle,
-} from "lucide-react";
+import { ArrowLeft, ShoppingCart, Loader2, ChevronDown, ChevronUp, AlertTriangle } from "lucide-react";
 import { supabaseBrowser } from "@/lib/supabase-browser";
 
-/* =============== Constantes / Tipos =============== */
 const ACCENT = "#01A920";
-const CART_KEY = "cart_v2_sizes";
 
-type SizeKey = "P" | "M" | "G" | "GG";
-const SIZE_LABELS: SizeKey[] = ["P", "M", "G", "GG"];
-
+/* ===================== Tipos ===================== */
 type Product = {
   id: string;
   title: string;
   description: string | null;
   price_cents: number;
   active: boolean;
-  amount: number | null; // para produtos sem variação
+  amount: number | null; // estoque base (sem variante)
 };
 
 type ImageRow = { storage_path: string; is_primary: boolean | null };
 
-type VariantGroupRow = { id: string; name: string; position: number; product_id: string };
-type VariantOptionRow = { id: string; variant_group_id: string; value: string };
+type VariantGroupRow = { id: string; product_id: string; name: string; position: number | null };
+type VariantOptionRow = { id: string; variant_group_id: string; value: string; position: number | null };
+type PVRow = { product_id: string; variant_option_id: string; amount: number };
+
+type SizeKey = "P" | "M" | "G" | "GG";
+const SIZE_LABELS: SizeKey[] = ["P", "M", "G", "GG"];
 
 type SizeEntry = { key: SizeKey; optionId: string; amount: number };
 
-/** Carrinho (union):
- * - COM VARIANTE: com variant_option_id/size
- * - SEM VARIANTE: sem esses campos
- */
-type CartItemWithVariant = {
+/* ===== Carrinho (união COM e SEM variação) ===== */
+type BaseCartItem = {
+  id: string; // `${product_id}`
+  product_id: string;
+  title: string;
+  price_cents: number;
+  imageUrl: string | null;
+  qty: number;
+  max?: number;
+};
+
+type VariantCartItem = {
   id: string; // `${product_id}:${variant_option_id}`
   product_id: string;
   variant_option_id: string;
@@ -51,22 +51,17 @@ type CartItemWithVariant = {
   qty: number;
   max?: number;
 };
-type CartItemNoVariant = {
-  id: string; // `${product_id}`
-  product_id: string;
-  title: string;
-  price_cents: number;
-  imageUrl: string | null;
-  qty: number;
-  max?: number;
-};
-type CartItem = CartItemWithVariant | CartItemNoVariant;
 
-/* =============== Utils =============== */
+type CartItem = BaseCartItem | VariantCartItem;
+
+/* ===================== Utils ===================== */
+const CART_KEY = "cart_v2_sizes";
+
 function formatPrice(cents: number) {
   return (cents / 100).toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
 }
 
+// Lê o carrinho do localStorage
 function readCartLS(): CartItem[] {
   try {
     const raw = localStorage.getItem(CART_KEY);
@@ -76,6 +71,7 @@ function readCartLS(): CartItem[] {
   }
 }
 
+// Escreve o carrinho no localStorage
 function writeCartLS(items: CartItem[]) {
   try {
     localStorage.setItem(CART_KEY, JSON.stringify(items));
@@ -84,35 +80,48 @@ function writeCartLS(items: CartItem[]) {
   }
 }
 
+// Conta itens (somatório das quantidades)
 function countCartLS(): number {
-  return readCartLS().reduce((sum, it) => sum + it.qty, 0);
+  const items = readCartLS();
+  return items.reduce((sum, it) => sum + it.qty, 0);
 }
 
-// Type guards para evitar `any`
-function isWithVariant(item: CartItem): item is CartItemWithVariant {
-  return (item as CartItemWithVariant).variant_option_id !== undefined;
+// Type guards
+function isVariantItem(
+  item: CartItem | Omit<VariantCartItem, "qty"> | Omit<BaseCartItem, "qty">
+): item is VariantCartItem {
+ 
+  return typeof (item as VariantCartItem).variant_option_id === "string";
 }
 
-/** Insere/atualiza item no LS somando quantidades, respeitando limite (max) */
-function upsertCartLS(item: Omit<CartItem, "qty">, addQty: number, max?: number): CartItem[] {
+// Insere/atualiza item somando quantidades, respeitando limite (max)
+function upsertCartLS(
+  item: Omit<BaseCartItem, "qty"> | Omit<VariantCartItem, "qty">,
+  addQty: number,
+  max?: number
+): CartItem[] {
   const cart = readCartLS();
   const idx = cart.findIndex((x) => x.id === item.id);
 
   if (idx >= 0) {
     const cur = cart[idx];
-    const limit = typeof max === "number" ? max : cur.max;
+    const limit = typeof max === "number" ? max : cur.max ?? undefined;
     const nextQty = limit ? Math.min(cur.qty + addQty, limit) : cur.qty + addQty;
-    const updated: CartItem = { ...cur, qty: Math.max(1, nextQty), max: limit };
-    const next = [...cart];
-    next[idx] = updated;
-    return next;
+    const updated = [...cart];
+    updated[idx] = { ...cur, qty: Math.max(1, nextQty), max: limit };
+    return updated;
   }
 
   const firstQty = Math.max(1, typeof max === "number" ? Math.min(addQty, max) : addQty);
-  return [...cart, { ...(item as CartItem), qty: firstQty, max }];
+  if (isVariantItem(item as VariantCartItem)) {
+    const v: VariantCartItem = { ...(item as Omit<VariantCartItem, "qty">), qty: firstQty, max };
+    return [...cart, v];
+  }
+  const b: BaseCartItem = { ...(item as Omit<BaseCartItem, "qty">), qty: firstQty, max };
+  return [...cart, b];
 }
 
-/* =============== Página =============== */
+/* ===================== Página ===================== */
 export default function ProductDetailsPage() {
   const params = useParams<{ id: string }>();
   const id = params.id;
@@ -126,17 +135,19 @@ export default function ProductDetailsPage() {
   const [images, setImages] = React.useState<string[]>([]);
   const [activeImg, setActiveImg] = React.useState(0);
 
-  // tamanhos/estoque deste produto
+  // Tamanhos (grupo "Tamanho") — se não houver, o produto é "sem variação"
   const [sizes, setSizes] = React.useState<SizeEntry[]>([]);
   const [selectedSize, setSelectedSize] = React.useState<SizeKey | null>(null);
 
-  // quantidade e carrinho
   const [qty, setQty] = React.useState(1);
   const [adding, setAdding] = React.useState(false);
-  const [cartCount, setCartCount] = React.useState(0);
 
+  // Badge do carrinho
+  const [cartCount, setCartCount] = React.useState(0);
   React.useEffect(() => {
+    // inicial
     setCartCount(countCartLS());
+    // atualiza se mudar em outra aba/janela
     function onStorage(e: StorageEvent) {
       if (e.key === CART_KEY) setCartCount(countCartLS());
     }
@@ -144,13 +155,12 @@ export default function ProductDetailsPage() {
     return () => window.removeEventListener("storage", onStorage);
   }, []);
 
-  // Carrega produto + imagens + tamanhos (se houver)
+  // Carrega dados do produto + imagens + variantes (grupo Tamanho)
   React.useEffect(() => {
     let ignore = false;
     (async () => {
       setLoading(true);
       setErr(null);
-
       try {
         // Produto
         const { data: prow, error: perr } = await supabase
@@ -176,35 +186,31 @@ export default function ProductDetailsPage() {
             return data.publicUrl;
           }) ?? [];
 
-        // Grupo "Tamanho" (se existir)
+        // Grupo "Tamanho"
         const { data: gdata, error: gerr } = await supabase
           .from("variant_groups")
-          .select("id, name, position, product_id")
+          .select("id, product_id, name, position")
           .eq("product_id", id)
           .eq("name", "Tamanho")
           .order("position", { ascending: true });
         if (gerr) throw gerr;
 
-        const vGroups = (gdata ?? []) as VariantGroupRow[];
+        const groups = (gdata ?? []) as VariantGroupRow[];
+
         let sizeEntries: SizeEntry[] = [];
-
-        if (vGroups.length > 0) {
-          const gid = vGroups[0].id;
-
-          // Opções P/M/G/GG
+        if (groups.length) {
+          const gid = groups[0].id;
+          // opções P/M/G/GG
           const { data: odata, error: oerr } = await supabase
             .from("variant_options")
-            .select("id, variant_group_id, value")
+            .select("id, variant_group_id, value, position")
             .eq("variant_group_id", gid)
-            .in("value", SIZE_LABELS);
+            .in("value", SIZE_LABELS)
+            .order("position", { ascending: true });
           if (oerr) throw oerr;
+          const options = (odata ?? []) as VariantOptionRow[];
+          const optionIds = options.map((o) => o.id);
 
-          const opts = (odata ?? []) as VariantOptionRow[];
-          const optionIds = opts.map((o) => o.id);
-
-          // Estoque por variante
-          type PV = { product_id: string; variant_option_id: string; amount: number };
-          let pvRows: PV[] = [];
           if (optionIds.length) {
             const { data: pv, error: pvErr } = await supabase
               .from("product_variants")
@@ -212,32 +218,33 @@ export default function ProductDetailsPage() {
               .eq("product_id", id)
               .in("variant_option_id", optionIds);
             if (pvErr) throw pvErr;
-            pvRows = (pv ?? []) as PV[];
-          }
 
-          // Monta entries ordenadas P/M/G/GG
-          sizeEntries = SIZE_LABELS.map((label) => {
-            const opt = opts.find((o) => o.value === label) || null;
-            const optId = opt?.id ?? "";
-            const amount =
-              pvRows.find((r) => r.variant_option_id === optId)?.amount ?? 0;
-            return { key: label, optionId: optId, amount };
-          }).filter((e) => e.optionId); // só os que existem no grupo
+            const stock = (pv ?? []) as PVRow[];
+
+            sizeEntries = SIZE_LABELS.map((label) => {
+              const opt = options.find((o) => o.value === label) || null;
+              const optionId = opt?.id ?? "";
+              const amount =
+                stock.find((s) => s.variant_option_id === optionId)?.amount ?? 0;
+              return { key: label, optionId, amount };
+            }).filter((e) => e.optionId);
+          }
         }
 
-        if (ignore) return;
+        if (!ignore) {
+          setProduct(prow);
+          setImages(urls);
+          setActiveImg(0);
+          setSizes(sizeEntries);
 
-        setProduct(prow);
-        setImages(urls);
-        setActiveImg(0);
-        setSizes(sizeEntries);
-
-        // pré-seleção: se existir apenas 1 tamanho com estoque > 0
-        const withStock = sizeEntries.filter((e) => e.amount > 0);
-        setSelectedSize(withStock.length === 1 ? withStock[0].key : null);
+          // pré-seleção: único tamanho com estoque > 0
+          const withStock = sizeEntries.filter((s) => s.amount > 0);
+          setSelectedSize(withStock.length === 1 ? withStock[0].key : null);
+        }
       } catch (e) {
         const msg = e instanceof Error ? e.message : "Falha ao carregar produto";
-        setErr(msg);
+        console.error(e);
+        if (!ignore) setErr(msg);
       } finally {
         if (!ignore) setLoading(false);
       }
@@ -247,42 +254,67 @@ export default function ProductDetailsPage() {
     };
   }, [id, supabase]);
 
-  // helpers derivados
   const hasVariants = sizes.length > 0;
-  const totalStock = hasVariants
-    ? sizes.reduce((s, e) => s + e.amount, 0)
-    : Math.max(0, Number(product?.amount ?? 0));
-  const isOut = totalStock <= 0;
-  const isLow = !isOut && totalStock < 10;
+  const maxStock = hasVariants
+    ? (() => {
+        const entry = selectedSize ? sizes.find((s) => s.key === selectedSize) : undefined;
+        return entry?.amount ?? 0;
+      })()
+    : product?.amount ?? 0;
 
-  // quantidade (respeita estoque disponível do contexto)
+  const allGroupsSelected = hasVariants ? Boolean(selectedSize) : true;
+
+  // Quantidade (respeita estoque)
   function handleDec() {
     setQty((q) => Math.max(1, q - 1));
   }
   function handleInc() {
-    const max = (() => {
-      if (!hasVariants) return Math.max(1, Number(product?.amount ?? 1));
-      const chosen = sizes.find((s) => s.key === selectedSize) || null;
-      return Math.max(1, Number(chosen?.amount ?? 1));
-    })();
+    const max = Math.max(1, maxStock || 1);
     setQty((q) => Math.min(max, q + 1));
   }
 
   // Adicionar ao carrinho
   function handleAddToCart() {
-    if (!product || !product.active) return;
+    if (!product) return;
+    if (!product.active) return;
+    if (!allGroupsSelected) return;
 
-    // Sem variantes
-    if (!hasVariants) {
-      const max = Math.max(0, Number(product.amount ?? 0));
-      if (max <= 0) {
-        alert("Produto esgotado no momento.");
-        return;
-      }
-      const desired = Math.max(1, Math.min(qty, max));
-      setAdding(true);
-      try {
-        const img = images[0] || null;
+    const baseMax = Math.max(0, maxStock || 0);
+    if (baseMax <= 0) {
+      alert("Produto esgotado no momento.");
+      return;
+    }
+
+    const desired = Math.max(1, Math.min(qty, baseMax));
+    setAdding(true);
+    try {
+      const img = images[0] || null;
+
+      if (hasVariants) {
+        // exige selectedSize e optionId
+        const entry = selectedSize ? sizes.find((s) => s.key === selectedSize) : undefined;
+        if (!entry) {
+          alert("Selecione um tamanho válido.");
+          return;
+        }
+
+        const updated = upsertCartLS(
+          {
+            id: `${product.id}:${entry.optionId}`,
+            product_id: product.id,
+            variant_option_id: entry.optionId,
+            size: entry.key,
+            title: product.title,
+            price_cents: product.price_cents,
+            imageUrl: img,
+            max: entry.amount,
+          },
+          desired,
+          entry.amount
+        );
+        writeCartLS(updated);
+      } else {
+        const base = Math.max(0, product.amount ?? 0);
         const updated = upsertCartLS(
           {
             id: product.id,
@@ -290,58 +322,23 @@ export default function ProductDetailsPage() {
             title: product.title,
             price_cents: product.price_cents,
             imageUrl: img,
-          } satisfies Omit<CartItemNoVariant, "qty">,
+            max: base,
+          },
           desired,
-          max
+          base
         );
         writeCartLS(updated);
-        setCartCount(countCartLS());
-      } finally {
-        setAdding(false);
       }
-      return;
-    }
 
-    // Com variantes
-    if (!selectedSize) {
-      alert("Selecione um tamanho.");
-      return;
-    }
-    const entry = sizes.find((s) => s.key === selectedSize);
-    if (!entry) {
-      alert("Tamanho indisponível para este produto.");
-      return;
-    }
-    if (entry.amount <= 0) {
-      alert("Este tamanho está esgotado.");
-      return;
-    }
-
-    const max = entry.amount;
-    const desired = Math.max(1, Math.min(qty, max));
-    const img = images[0] || null;
-
-    setAdding(true);
-    try {
-      const updated = upsertCartLS(
-        {
-          id: `${product.id}:${entry.optionId}`,
-          product_id: product.id,
-          variant_option_id: entry.optionId,
-          size: selectedSize,
-          title: product.title,
-          price_cents: product.price_cents,
-          imageUrl: img,
-        } satisfies Omit<CartItemWithVariant, "qty">,
-        desired,
-        max
-      );
-      writeCartLS(updated);
-      setCartCount(countCartLS());
+      setCartCount(countCartLS()); // atualiza badge
+      // opcional: router.push("/") para mostrar a Home com o badge já atualizado
     } finally {
       setAdding(false);
     }
   }
+
+  const isOut = (maxStock ?? 0) <= 0;
+  const isLow = !isOut && (maxStock ?? 0) < 10;
 
   return (
     <main className="min-h-dvh bg-white text-gray-900">
@@ -379,13 +376,9 @@ export default function ProductDetailsPage() {
             <Loader2 className="w-4 h-4 animate-spin" /> Carregando...
           </div>
         ) : err ? (
-          <div className="p-3 rounded-xl border border-red-200 bg-red-50 text-sm text-red-700">
-            {err}
-          </div>
+          <div className="p-3 rounded-xl border border-red-200 bg-red-50 text-sm text-red-700">{err}</div>
         ) : !product ? (
-          <div className="p-3 rounded-xl border border-gray-100 bg-gray-50 text-sm text-gray-600">
-            Produto não encontrado.
-          </div>
+          <div className="p-3 rounded-xl border border-gray-100 bg-gray-50 text-sm text-gray-600">Produto não encontrado.</div>
         ) : (
           <div className="space-y-4">
             {/* Galeria */}
@@ -393,11 +386,7 @@ export default function ProductDetailsPage() {
               <div className="bg-gray-100 aspect-[3/4] w-full flex items-center justify-center overflow-hidden">
                 {images[activeImg] ? (
                   // eslint-disable-next-line @next/next/no-img-element
-                  <img
-                    src={images[activeImg]}
-                    alt={product.title}
-                    className="w-full h-full object-cover"
-                  />
+                  <img src={images[activeImg]} alt={product.title} className="w-full h-full object-cover" />
                 ) : (
                   <div className="w-16 h-16 rounded-lg bg-gray-200" />
                 )}
@@ -422,15 +411,11 @@ export default function ProductDetailsPage() {
 
             {/* Título & preço */}
             <div className="flex items-start justify-between gap-3">
-              <h1 className="text-base font-semibold leading-tight flex-1">
-                {product.title}
-              </h1>
-              <div className="text-base font-semibold whitespace-nowrap">
-                {formatPrice(product.price_cents)}
-              </div>
+              <h1 className="text-base font-semibold leading-tight flex-1">{product.title}</h1>
+              <div className="text-base font-semibold whitespace-nowrap">{formatPrice(product.price_cents)}</div>
             </div>
 
-            {/* Estoque info (total) */}
+            {/* Estoque info */}
             {isOut ? (
               <div className="inline-flex items-center gap-2 px-2 py-1 rounded-full text-xs text-red-700 bg-red-50 border border-red-200">
                 ESGOTADO
@@ -438,7 +423,7 @@ export default function ProductDetailsPage() {
             ) : isLow ? (
               <div className="inline-flex items-center gap-2 px-2 py-1 rounded-full text-xs text-orange-700 bg-orange-50 border border-orange-200">
                 <AlertTriangle className="w-3 h-3" />
-                Restam {totalStock} un.
+                Restam {maxStock} un.
               </div>
             ) : null}
 
@@ -451,7 +436,7 @@ export default function ProductDetailsPage() {
               )}
             </DetailsAccordion>
 
-            {/* Seletor de tamanhos (quando existir) */}
+            {/* Seletor de tamanho (se houver variantes) */}
             {hasVariants && (
               <div>
                 <div className="text-sm font-medium mb-1">Tamanho</div>
@@ -459,9 +444,7 @@ export default function ProductDetailsPage() {
                   {SIZE_LABELS.map((sz) => {
                     const entry = sizes.find((e) => e.key === sz);
                     const exists = Boolean(entry);
-                    const hasStockSz = (entry?.amount ?? 0) > 0;
                     const active = selectedSize === sz;
-
                     return (
                       <button
                         key={sz}
@@ -469,18 +452,10 @@ export default function ProductDetailsPage() {
                         disabled={!exists}
                         onClick={() => setSelectedSize(sz)}
                         className={`px-3 py-1.5 rounded-full border text-sm ${
-                          active
-                            ? "text-white border-transparent"
-                            : "text-gray-700 border-gray-200 bg-gray-50"
+                          active ? "text-white border-transparent" : "text-gray-700 border-gray-200 bg-gray-50"
                         } disabled:opacity-40 disabled:cursor-not-allowed`}
                         style={active ? { backgroundColor: ACCENT } : {}}
-                        title={
-                          !exists
-                            ? "Tamanho não disponível"
-                            : hasStockSz
-                            ? `Disponível: ${entry?.amount} un.`
-                            : "Esgotado neste tamanho"
-                        }
+                        title={!exists ? "Tamanho indisponível" : `Estoque: ${entry?.amount ?? 0} un.`}
                       >
                         {sz}
                       </button>
@@ -500,19 +475,14 @@ export default function ProductDetailsPage() {
                 <button
                   onClick={handleInc}
                   className="w-8 h-8 grid place-items-center"
-                  disabled={
-                    isOut ||
-                    (hasVariants
-                      ? qty >= (sizes.find((s) => s.key === selectedSize)?.amount ?? 1)
-                      : qty >= Math.max(1, Number(product.amount ?? 1)))
-                  }
+                  disabled={isOut || qty >= Math.max(1, maxStock || 1)}
                 >
                   +
                 </button>
               </div>
               <button
                 onClick={handleAddToCart}
-                disabled={!product.active || adding || isOut || (hasVariants && !selectedSize)}
+                disabled={!product.active || adding || !allGroupsSelected || isOut}
                 className="flex-1 px-3 py-3 rounded-xl text-white disabled:opacity-50"
                 style={{ backgroundColor: ACCENT }}
               >
@@ -539,22 +509,12 @@ export default function ProductDetailsPage() {
   );
 }
 
-/* =============== Accordion =============== */
-function DetailsAccordion({
-  title,
-  children,
-}: {
-  title: string;
-  children: React.ReactNode;
-}) {
+/* ===================== Accordion ===================== */
+function DetailsAccordion({ title, children }: { title: string; children: React.ReactNode }) {
   const [open, setOpen] = React.useState(true);
   return (
     <div className="rounded-2xl border border-gray-100">
-      <button
-        type="button"
-        onClick={() => setOpen((o) => !o)}
-        className="w-full flex items-center justify-between px-3 py-2"
-      >
+      <button type="button" onClick={() => setOpen((o) => !o)} className="w-full flex items-center justify-between px-3 py-2">
         <span className="text-sm font-medium">{title}</span>
         {open ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
       </button>

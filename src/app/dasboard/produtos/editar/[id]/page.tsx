@@ -25,7 +25,7 @@ type Product = {
   price_cents: number;
   active: boolean;
   created_at: string;
-  amount: number; // ✅ estoque
+  amount: number; // campo existe no banco, mas não usamos mais aqui
 };
 type ProductImage = {
   id: string;
@@ -40,7 +40,6 @@ type FormState = {
   priceBRL: string;
   active: boolean;
   categoryIds: string[];
-  amount: number; // ✅ estoque
   newImageFile?: File | null;
   currentImageUrl?: string | null;
   currentImagePath?: string | null;
@@ -64,7 +63,6 @@ export default function EditProductPage() {
     priceBRL: "",
     active: true,
     categoryIds: [],
-    amount: 0, // ✅ inicia 0 até carregar
     newImageFile: null,
     currentImageUrl: null,
     currentImagePath: null,
@@ -84,9 +82,20 @@ export default function EditProductPage() {
     return cents.toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
   }
   function parseBRLToCents(masked: string) {
-    const cleaned = masked.replace("R$", "").split(" ").join("").split(".").join("").replace(",", ".");
+    const cleaned = masked
+      .replace("R$", "")
+      .split(" ")
+      .join("")
+      .split(".")
+      .join("")
+      .replace(",", ".");
     const num = Number(cleaned || "0");
     return Math.round(num * 100);
+  }
+  // 🔧 formata diretamente de centavos para BRL (evita R$ 0,59 quando é 5900)
+  function formatBRLFromCents(cents: number) {
+    const value = (Number.isFinite(cents) ? cents : 0) / 100;
+    return value.toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
   }
 
   // Carregar produto + imagem primária + categorias vinculadas
@@ -148,10 +157,10 @@ export default function EditProductPage() {
           setForm({
             title: p.title,
             description: p.description ?? "",
-            priceBRL: maskBRL(String(p.price_cents / 100)),
+            // ✅ usa formatador a partir de centavos (corrige R$ 0,57 → R$ 59,00)
+            priceBRL: formatBRLFromCents(p.price_cents),
             active: p.active,
             categoryIds: selectedIds,
-            amount: Number.isFinite(p.amount) ? p.amount : 0, // ✅ carrega estoque
             newImageFile: null,
             currentImageUrl,
             currentImagePath,
@@ -187,15 +196,6 @@ export default function EditProductPage() {
     }));
   }
 
-  // ✅ helpers de estoque
-  function setAmount(n: number) {
-    const clamped = Math.max(0, Math.trunc(Number.isNaN(n) ? 0 : n));
-    setForm((f) => ({ ...f, amount: clamped }));
-  }
-  function adjustAmount(delta: number) {
-    setAmount((form.amount || 0) + delta);
-  }
-
   async function handleRemoveCurrentImage() {
     if (!form.currentImagePath) return;
     if (!confirm("Remover a imagem atual?")) return;
@@ -229,11 +229,10 @@ export default function EditProductPage() {
 
     try {
       if (!form.title.trim()) throw new Error("Informe o nome do produto");
-      if (!Number.isInteger(form.amount) || form.amount < 0) throw new Error("Estoque deve ser inteiro ≥ 0");
 
       const price_cents = parseBRLToCents(form.priceBRL);
 
-      // 1) Atualiza produto (inclui amount ✅)
+      // 1) Atualiza produto (sem amount)
       const { error: upErr } = await supabase
         .from("products")
         .update({
@@ -241,7 +240,6 @@ export default function EditProductPage() {
           description: form.description.trim() || null,
           price_cents,
           active: form.active,
-          amount: form.amount, // ✅
         })
         .eq("id", id);
       if (upErr) throw upErr;
@@ -382,60 +380,6 @@ export default function EditProductPage() {
             placeholder="R$ 0,00"
             className="w-full px-3 py-2 rounded-xl border border-gray-200 focus:outline-none focus:ring-4"
           />
-        </div>
-
-        {/* ✅ Estoque */}
-        <div className="space-y-1">
-          <label className="text-sm text-gray-700">Estoque (unidades)</label>
-          <div className="flex items-center gap-2">
-            <div className="flex items-center gap-2">
-              <button
-                type="button"
-                onClick={() => adjustAmount(-5)}
-                className="px-2 py-1 rounded-lg border border-gray-200 text-xs bg-white"
-                title="-5"
-              >
-                −5
-              </button>
-              <button
-                type="button"
-                onClick={() => adjustAmount(-1)}
-                className="px-2 py-1 rounded-lg border border-gray-200 text-xs bg-white"
-                title="-1"
-              >
-                −1
-              </button>
-            </div>
-            <input
-              type="number"
-              inputMode="numeric"
-              min={0}
-              step={1}
-              value={Number.isNaN(form.amount) ? 0 : form.amount}
-              onChange={(e) => setAmount(Number(e.target.value))}
-              placeholder="0"
-              className="w-28 px-3 py-2 rounded-xl border border-gray-200 focus:outline-none focus:ring-4 text-center tabular-nums"
-            />
-            <div className="flex items-center gap-2">
-              <button
-                type="button"
-                onClick={() => adjustAmount(1)}
-                className="px-2 py-1 rounded-lg border border-gray-200 text-xs bg-white"
-                title="+1"
-              >
-                +1
-              </button>
-              <button
-                type="button"
-                onClick={() => adjustAmount(5)}
-                className="px-2 py-1 rounded-lg border border-gray-200 text-xs bg-white"
-                title="+5"
-              >
-                +5
-              </button>
-            </div>
-          </div>
-          <p className="text-xs text-gray-500">Dica: use os botões para ajustar rapidamente o estoque.</p>
         </div>
 
         {/* Categorias */}

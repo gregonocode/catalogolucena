@@ -1,19 +1,26 @@
+// src/app/dasboard/config/page.tsx
 "use client";
 
 import React from "react";
-import { Loader2, Image as ImageIcon, Upload, Trash2, Check, X, RefreshCw } from "lucide-react";
+import {
+  Loader2,
+  Image as ImageIcon,
+  Upload,
+  Trash2,
+  Check,
+  X,
+  RefreshCw,
+} from "lucide-react";
 import { supabaseBrowser } from "@/lib/supabase-browser";
 import type { PostgrestError } from "@supabase/supabase-js";
 
-// Cor de destaque padrão (mantém seu padrão do projeto)
 const ACCENT = "#01A920";
 
-// Tipos
 type StoreSettings = {
   id: string;
   store_name: string | null;
   whatsapp_e164: string | null;
-  link_banner: string | null; // novo campo na tabela store_settings
+  link_banner: string | null;
 };
 
 function isPgErr(e: unknown): e is PostgrestError {
@@ -34,29 +41,56 @@ export default function StoreConfigPage() {
   const [bannerUrl, setBannerUrl] = React.useState<string | null>(null);
   const [bannerFile, setBannerFile] = React.useState<File | null>(null);
 
-  // Helpers
+  // ===== Helpers =====
   function onlyDigits(s: string) {
     return Array.from(s)
       .filter((c) => c >= "0" && c <= "9")
       .join("");
   }
   function normalizeToE164BR(input: string) {
-    // Aceita formatos variados e tenta normalizar para +55XXXXXXXXXXX
     const digits = onlyDigits(input);
     if (!digits) return "";
-    if (digits.startsWith("55")) return "+" + digits; // já tem DDI
+    if (digits.startsWith("55")) return "+" + digits;
     return "+55" + digits;
   }
+  function folderFor(id: string) {
+    return `store/${id}`;
+  }
 
+  async function listFolderFiles(folderPath: string) {
+    // Supabase list() usa o path de “diretório”; garantindo sem barra final
+    const clean = folderPath.replace(/\/+$/, "");
+    const { data, error } = await supabase.storage
+      .from("banner")
+      .list(clean, { limit: 100, offset: 0 }); // ajuste se precisar paginação
+    if (error) throw error;
+    return data ?? [];
+  }
+
+  async function removeAllInFolderExcept(folderPath: string, keepBasename?: string) {
+    const files = await listFolderFiles(folderPath);
+    const toDelete = files
+      .filter((f) => (keepBasename ? f.name !== keepBasename : true))
+      .map((f) => `${folderPath.replace(/\/+$/, "")}/${f.name}`);
+    if (toDelete.length) {
+      const { error: remErr } = await supabase.storage.from("banner").remove(toDelete);
+      if (remErr) throw remErr;
+    }
+  }
+
+  async function removeAllInFolder(folderPath: string) {
+    await removeAllInFolderExcept(folderPath, undefined);
+  }
+
+  // ===== Data load =====
   async function loadSettings() {
     setLoading(true);
     setErr(null);
     setOk(null);
     try {
-      // Busca a linha mais recente (ou única) de store_settings
       const { data, error } = await supabase
         .from("store_settings")
-        .select("id, store_name, whatsapp_e164, link_banner")
+        .select("id, store_name, whatsapp_e164, link_banner, created_at")
         .order("created_at", { ascending: false })
         .limit(1)
         .maybeSingle();
@@ -64,7 +98,6 @@ export default function StoreConfigPage() {
       if (error) throw error;
 
       if (!data) {
-        // Se não existir, cria uma linha inicial
         const { data: inserted, error: insErr } = await supabase
           .from("store_settings")
           .insert({ store_name: "Minha Loja", whatsapp_e164: null, link_banner: null })
@@ -103,7 +136,7 @@ export default function StoreConfigPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // nova verssao do hand
+  // ===== Save =====
   async function handleSave(e: React.FormEvent) {
     e.preventDefault();
     setSaving(true);
@@ -118,21 +151,30 @@ export default function StoreConfigPage() {
 
       let finalBannerUrl: string | null = bannerUrl ?? null;
 
-      // 1) Upload opcional do banner
+      // Upload + limpeza para manter somente 1 imagem no bucket
       if (bannerFile) {
-        const path = `store/${rowId}/${Date.now()}-${bannerFile.name}`;
-        const { error: upErr } = await supabase.storage.from("banner").upload(path, bannerFile, {
-          cacheControl: "3600",
-          upsert: true,
-          contentType: bannerFile.type || undefined,
-        });
+        const baseFolder = folderFor(rowId); // ex.: store/UUID
+        const basename = `${Date.now()}-${bannerFile.name}`;
+        const fullPath = `${baseFolder}/${basename}`;
+
+        // 1) Sobe o novo arquivo
+        const { error: upErr } = await supabase.storage
+          .from("banner")
+          .upload(fullPath, bannerFile, {
+            cacheControl: "3600",
+            upsert: true,
+            contentType: bannerFile.type || undefined,
+          });
         if (upErr) throw upErr;
 
-        const { data } = supabase.storage.from("banner").getPublicUrl(path);
+        const { data } = supabase.storage.from("banner").getPublicUrl(fullPath);
         finalBannerUrl = data.publicUrl;
+
+        // 2) Remove tudo que não for o arquivo recém-enviado
+        await removeAllInFolderExcept(baseFolder, basename);
       }
 
-      // 2) UPDATE sem pedir retorno (evita o problema do .single)
+      // Atualiza a tabela
       const { error: updErr } = await supabase
         .from("store_settings")
         .update({
@@ -141,16 +183,14 @@ export default function StoreConfigPage() {
           link_banner: finalBannerUrl,
         })
         .eq("id", rowId);
-
       if (updErr) throw updErr;
 
-      // 3) SELECT separado (pode usar maybeSingle para evitar o erro)
+      // Recarrega a linha (garantir consistência visual)
       const { data: refreshed, error: selErr } = await supabase
         .from("store_settings")
         .select("id, store_name, whatsapp_e164, link_banner")
         .eq("id", rowId)
         .maybeSingle();
-
       if (selErr) throw selErr;
 
       setBannerUrl(refreshed?.link_banner ?? finalBannerUrl);
@@ -166,14 +206,25 @@ export default function StoreConfigPage() {
     }
   }
 
+  // ===== Remove banner (e limpa a pasta toda) =====
   async function handleRemoveBanner() {
     if (!rowId) return;
     setSaving(true);
     setOk(null);
     setErr(null);
+
     try {
-      const { error } = await supabase.from("store_settings").update({ link_banner: null }).eq("id", rowId);
+      // 1) Apaga o link do DB
+      const { error } = await supabase
+        .from("store_settings")
+        .update({ link_banner: null })
+        .eq("id", rowId);
       if (error) throw error;
+
+      // 2) Remove TODOS os arquivos do diretório do banner
+      await removeAllInFolder(folderFor(rowId));
+
+      // 3) Estado
       setBannerUrl(null);
       setBannerFile(null);
       setOk("Banner removido");
@@ -198,7 +249,9 @@ export default function StoreConfigPage() {
       </div>
 
       {loading ? (
-        <div className="p-3 rounded-xl border border-gray-100 bg-gray-50 text-sm text-gray-600">Carregando configurações...</div>
+        <div className="p-3 rounded-xl border border-gray-100 bg-gray-50 text-sm text-gray-600">
+          Carregando configurações...
+        </div>
       ) : (
         <form onSubmit={handleSave} className="space-y-5">
           {/* Nome da loja */}
@@ -222,12 +275,16 @@ export default function StoreConfigPage() {
               placeholder="Ex.: +5591999999999"
               className="w-full px-3 py-2 rounded-xl border border-gray-200 focus:outline-none focus:ring-4"
             />
-            <p className="text-xs text-gray-500">Use o formato internacional, ex.: +55DDDXXXXXXXX</p>
+            <p className="text-xs text-gray-500">
+              Use o formato internacional, ex.: +55DDDXXXXXXXX
+            </p>
           </div>
 
           {/* Banner */}
           <div className="space-y-2">
-            <label className="text-sm text-gray-700">Banner da loja - Proporção ideal Mobile 1190 × 462 px </label>
+            <label className="text-sm text-gray-700">
+              Banner da loja — Proporção ideal Mobile 1190 × 462 px
+            </label>
 
             {bannerUrl ? (
               <div className="rounded-2xl border border-gray-100 overflow-hidden">
@@ -255,7 +312,9 @@ export default function StoreConfigPage() {
                 <div className="text-xs text-gray-500">PNG ou JPG até 5MB</div>
               </div>
               {bannerFile ? (
-                <span className="text-xs text-gray-600 truncate max-w-[160px]">{bannerFile.name}</span>
+                <span className="text-xs text-gray-600 truncate max-w-[160px]">
+                  {bannerFile.name}
+                </span>
               ) : (
                 <Upload className="w-4 h-4 text-gray-500" />
               )}
@@ -272,13 +331,6 @@ export default function StoreConfigPage() {
               </button>
             </div>
           </div>
-
-          {/* Sugestões de futuros campos (opcional):
-              - accent_hex (cor da marca) -> pode ler da tabela depois para aplicar no front
-              - headline / subheadline do banner
-              - links de redes sociais
-              - endereço físico
-          */}
 
           <div className="flex items-center gap-2 pt-1">
             <button
@@ -316,7 +368,8 @@ export default function StoreConfigPage() {
             <strong>banner</strong>.
           </li>
           <li>
-            O banner é salvo no bucket <code>banner</code> e o <code>link_banner</code> recebe a URL pública.
+            O banner é salvo no bucket <code>banner</code> em <code>store/{"{id}"}</code>. O
+            sistema mantém **apenas 1 arquivo** nesse diretório.
           </li>
         </ol>
       </div>

@@ -1,3 +1,4 @@
+// src/app/dasboard/produtos/page.tsx
 "use client";
 
 import React from "react";
@@ -56,7 +57,9 @@ export default function ProductsListPage() {
   const supabase = supabaseBrowser();
 
   const [search, setSearch] = React.useState("");
-  const [orderBy, setOrderBy] = React.useState<keyof ProductWithStockRow | "total_stock">("created_at");
+  const [orderBy, setOrderBy] = React.useState<keyof ProductWithStockRow | "total_stock">(
+    "created_at"
+  );
   const [ascending, setAscending] = React.useState(false);
 
   const [page, setPage] = React.useState(0);
@@ -187,7 +190,11 @@ export default function ProductsListPage() {
   }
 
   async function handleDelete(productId: string) {
-    if (!confirm("Tem certeza que deseja excluir este produto? As imagens no storage também serão removidas.")) {
+    if (
+      !confirm(
+        "Tem certeza que deseja excluir este produto? As imagens no storage também serão removidas."
+      )
+    ) {
       return;
     }
 
@@ -195,7 +202,15 @@ export default function ProductsListPage() {
     setOk(null);
 
     try {
-      // 1) Remover arquivos do storage (se houver)
+      // 0) Verificar se existe item de pedido referenciando o produto
+      const { count: orderItemsCount, error: countErr } = await supabase
+        .from("order_items")
+        .select("id", { count: "exact", head: true })
+        .eq("product_id", productId);
+
+      if (countErr) throw countErr;
+
+      // 1) Carregar imagens (para eventualmente remover do storage)
       const { data: imgs, error: imgErr } = await supabase
         .from("product_images")
         .select("storage_path")
@@ -207,27 +222,54 @@ export default function ProductsListPage() {
         .map((i) => (i as { storage_path: string | null }).storage_path)
         .filter((pth): pth is string => typeof pth === "string" && pth.length > 0);
 
+      // ====== CASO 1: Já existe em pedidos → SOFT DELETE ======
+      if ((orderItemsCount ?? 0) > 0) {
+        const { error: softErr } = await supabase
+          .from("products")
+          .update({ deleted_at: new Date().toISOString(), active: false })
+          .eq("id", productId);
+        if (softErr) throw softErr;
+
+        if (paths.length) {
+          const { error: remErr } = await supabase.storage.from("produtos").remove(paths);
+          if (remErr) console.warn("Falha ao remover arquivos:", remErr.message);
+        }
+
+        await supabase.from("product_images").delete().eq("product_id", productId);
+        await supabase.from("product_categories").delete().eq("product_id", productId);
+
+        setRows((prev) => prev.filter((it) => it.product.id !== productId));
+        setOk("Produto arquivado (soft delete). Itens de pedido existentes foram preservados.");
+        if (rows.length - 1 === 0 && page > 0) setPage((p) => p - 1);
+        else setTotal((t) => Math.max(0, t - 1));
+        return;
+      }
+
+      // ====== CASO 2: Não aparece em pedidos → HARD DELETE ======
       if (paths.length) {
         const { error: remErr } = await supabase.storage.from("produtos").remove(paths);
         if (remErr) console.warn("Falha ao remover arquivos:", remErr.message);
       }
 
-      // 2) Remover linhas relacionadas (FKs com CASCADE já ajudam, mas limpamos helpers)
       await supabase.from("product_images").delete().eq("product_id", productId);
       await supabase.from("product_categories").delete().eq("product_id", productId);
-      // product_variants será removida por ON DELETE CASCADE (FK em product_variants.product_id)
 
-      // 3) Remover o produto
       const { error: delErr } = await supabase.from("products").delete().eq("id", productId);
       if (delErr) throw delErr;
 
-      // 4) Atualizar UI
       setRows((prev) => prev.filter((it) => it.product.id !== productId));
-      setOk("Produto excluído");
+      setOk("Produto excluído definitivamente.");
       if (rows.length - 1 === 0 && page > 0) setPage((p) => p - 1);
       else setTotal((t) => Math.max(0, t - 1));
     } catch (e: unknown) {
-      setErr(errorMessage(e));
+      const msg = errorMessage(e);
+      if (msg.includes("violates foreign key constraint") || msg.includes("foreign key")) {
+        setErr(
+          "Este produto já foi usado em pedidos. Ele não pode ser apagado; realize o arquivamento (soft delete)."
+        );
+      } else {
+        setErr(msg);
+      }
     }
   }
 
@@ -281,7 +323,9 @@ export default function ProductsListPage() {
         <select
           value={orderBy}
           onChange={(e) =>
-            setOrderBy(e.target.value as "created_at" | "title" | "price_cents" | "total_stock" | "active")
+            setOrderBy(
+              e.target.value as "created_at" | "title" | "price_cents" | "total_stock" | "active"
+            )
           }
           className="px-2 py-1 rounded-lg border border-gray-200 text-sm"
         >
@@ -349,7 +393,9 @@ export default function ProductsListPage() {
                   </div>
 
                   {/* Preço */}
-                  <div className="text-sm whitespace-nowrap">{formatBRLFromCents(p.price_cents)}</div>
+                  <div className="text-sm whitespace-nowrap">
+                    {formatBRLFromCents(p.price_cents)}
+                  </div>
 
                   {/* Estoque total (da view) */}
                   <div className="text-sm">
@@ -358,7 +404,11 @@ export default function ProductsListPage() {
                         Esgotado
                       </span>
                     ) : (
-                      <span className={`tabular-nums ${isLow ? "text-orange-600" : "text-gray-800"}`}>{totalStock}</span>
+                      <span
+                        className={`tabular-nums ${isLow ? "text-orange-600" : "text-gray-800"}`}
+                      >
+                        {totalStock}
+                      </span>
                     )}
                   </div>
 
@@ -367,7 +417,9 @@ export default function ProductsListPage() {
                     <button
                       type="button"
                       onClick={() => toggleActive(p.id, !p.active)}
-                      className={`w-12 h-6 rounded-full relative transition-colors ${p.active ? "bg-emerald-500" : "bg-gray-300"}`}
+                      className={`w-12 h-6 rounded-full relative transition-colors ${
+                        p.active ? "bg-emerald-500" : "bg-gray-300"
+                      }`}
                       title={p.active ? "Desativar" : "Ativar"}
                     >
                       <span
@@ -376,8 +428,13 @@ export default function ProductsListPage() {
                         }`}
                       />
                     </button>
-                    <span className={`inline-flex items-center gap-1 text-xs ${p.active ? "text-emerald-700" : "text-gray-600"}`}>
-                      {p.active ? <Check className="w-4 h-4" /> : <X className="w-4 h-4" />} {p.active ? "Ativo" : "Inativo"}
+                    <span
+                      className={`inline-flex items-center gap-1 text-xs ${
+                        p.active ? "text-emerald-700" : "text-gray-600"
+                      }`}
+                    >
+                      {p.active ? <Check className="w-4 h-4" /> : <X className="w-4 h-4" />}{" "}
+                      {p.active ? "Ativo" : "Inativo"}
                     </span>
                   </div>
 

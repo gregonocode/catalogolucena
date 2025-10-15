@@ -1,3 +1,4 @@
+// src/app/dashboard/pedidos/page.tsx
 "use client";
 
 import React from "react";
@@ -19,6 +20,7 @@ import {
 const ACCENT = "#01A920";
 const PAGE_SIZE = 10;
 
+/* ===================== Tipos ===================== */
 type OrderRow = {
   id: number;
   order_code: string; // '#00001'
@@ -32,6 +34,7 @@ type OrderRow = {
 };
 
 type ProductLite = { id: string; title: string };
+
 type RawOrderItemRow = {
   id: number;
   order_id: number;
@@ -39,6 +42,8 @@ type RawOrderItemRow = {
   price_cents: number;
   size_label: string | null;
   variant_option_id: string | null;
+  color_option_id: string | null;
+  color_label: string | null;
   product: ProductLite | ProductLite[] | null;
 };
 
@@ -49,6 +54,8 @@ type OrderItemRow = {
   price_cents: number;
   size_label: string | null;
   variant_option_id: string | null;
+  color_option_id: string | null;
+  color_label: string | null;
   product: ProductLite | null;
 };
 
@@ -59,20 +66,43 @@ type ProductPick = {
   amount: number | null; // estoque "base" (produtos sem variação)
 };
 
-type VariantGroupRow = { id: string; product_id: string; name: string; position: number };
-type VariantOptionRow = { id: string; variant_group_id: string; value: string };
+type VariantGroupRow = { id: string; product_id: string; name: string; position?: number };
+type VariantOptionRow = { id: string; variant_group_id: string; value: string; position?: number };
+
 type PVRow = { product_id: string; variant_option_id: string; amount: number };
+
+type VariantSetOptionRow = { variant_option_id: string };
+type VariantSetRow = {
+  amount: number;
+  product_variant_set_options: VariantSetOptionRow[];
+};
 
 type SizeKey = "P" | "M" | "G" | "GG";
 const SIZE_LABELS: SizeKey[] = ["P", "M", "G", "GG"];
 
 type SizeEntry = { key: SizeKey; optionId: string; amount: number };
 
+type ColorEntry = { id: string; name: string };
+
+type OrderItemInsert = {
+  order_id: number;
+  product_id: string;
+  quantity: number;
+  price_cents: number;
+  variant_option_id?: string;
+  size_label?: SizeKey | null;
+  color_option_id?: string | null;
+  color_label?: string | null;
+};
+
+/* ===================== Utils ===================== */
 function formatBRL(cents: number) {
   const v = (cents || 0) / 100;
   return v.toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
 }
+const norm = (s: string) => s.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
 
+/* ===================== Página ===================== */
 export default function OrdersPage() {
   const supabase = supabaseBrowser();
 
@@ -100,6 +130,11 @@ export default function OrdersPage() {
   const [sizesByOrder, setSizesByOrder] = React.useState<Record<number, SizeEntry[]>>({});
   const [selectedSizeByOrder, setSelectedSizeByOrder] = React.useState<Record<number, SizeKey | null>>({});
 
+  // --- NOVOS estados de COR e matriz de combinação ---
+  const [colorsByOrder, setColorsByOrder] = React.useState<Record<number, ColorEntry[]>>({});
+  const [selectedColorByOrder, setSelectedColorByOrder] = React.useState<Record<number, string | null>>({});
+  const [stockByComboByOrder, setStockByComboByOrder] = React.useState<Record<number, Record<string, number>>>({});
+
   const totalPages = React.useMemo(
     () => Math.max(1, Math.ceil(total / PAGE_SIZE)),
     [total]
@@ -122,7 +157,9 @@ export default function OrdersPage() {
       if (search.trim()) {
         const q = search.trim();
         const maybeHash = q.startsWith("#") ? q : `#${q}`;
-        base = base.or(`order_code.ilike.%${maybeHash}%`);
+        base = base.or(
+          `order_code.ilike.%${maybeHash}%,customer_name.ilike.%${q}%,customer_phone.ilike.%${q}%`
+        );
       }
 
       const { data, error, count } = await base.range(from, to);
@@ -148,7 +185,7 @@ export default function OrdersPage() {
       const { data, error } = await supabase
         .from("order_items")
         .select(
-          "id, order_id, quantity, price_cents, size_label, variant_option_id, product:products(id, title)"
+          "id, order_id, quantity, price_cents, size_label, variant_option_id, color_option_id, color_label, product:products(id, title)"
         )
         .eq("order_id", orderId)
         .order("id", { ascending: true });
@@ -170,6 +207,8 @@ export default function OrdersPage() {
           price_cents: row.price_cents,
           size_label: row.size_label,
           variant_option_id: row.variant_option_id,
+          color_option_id: row.color_option_id,
+          color_label: row.color_label,
           product,
         };
       });
@@ -182,6 +221,11 @@ export default function OrdersPage() {
       setProductResultsByOrder((prev) => ({ ...prev, [orderId]: prev[orderId] ?? [] }));
       setSizesByOrder((prev) => ({ ...prev, [orderId]: prev[orderId] ?? [] }));
       setSelectedSizeByOrder((prev) => ({ ...prev, [orderId]: prev[orderId] ?? null }));
+
+      // novos defaults de cor/matriz
+      setColorsByOrder((prev) => ({ ...prev, [orderId]: prev[orderId] ?? [] }));
+      setSelectedColorByOrder((prev) => ({ ...prev, [orderId]: prev[orderId] ?? null }));
+      setStockByComboByOrder((prev) => ({ ...prev, [orderId]: prev[orderId] ?? {} }));
     } catch (e) {
       setErr(e instanceof Error ? e.message : "Erro ao carregar itens do pedido");
     } finally {
@@ -280,70 +324,162 @@ export default function OrdersPage() {
     }
   }
 
-  // Carregar variantes/estoque do produto selecionado (grupo "Tamanho")
+  /* ============ VARIAÇÕES: carregar tamanhos/cores/matriz ============ */
   async function loadSizesForSelected(orderId: number, product: ProductPick) {
     try {
-      // grupos de tamanho
+      // Busca grupos (case-insensitive)
       const { data: gdata, error: gerr } = await supabase
         .from("variant_groups")
         .select("id, product_id, name, position")
         .eq("product_id", product.id)
-        .eq("name", "Tamanho")
         .order("position", { ascending: true });
       if (gerr) throw gerr;
 
       const groups = (gdata ?? []) as VariantGroupRow[];
-      if (!groups.length) {
-        setSizesByOrder((prev) => ({ ...prev, [orderId]: [] }));
-        setSelectedSizeByOrder((prev) => ({ ...prev, [orderId]: null }));
+      const sizeGroup = groups.find((g) => norm(g.name) === "tamanho") || null;
+      const colorGroup = groups.find((g) => norm(g.name) === "cor") || null;
+
+      // Sem variação
+      if (!sizeGroup && !colorGroup) {
+        setSizesByOrder((p) => ({ ...p, [orderId]: [] }));
+        setSelectedSizeByOrder((p) => ({ ...p, [orderId]: null }));
+        setColorsByOrder((p) => ({ ...p, [orderId]: [] }));
+        setSelectedColorByOrder((p) => ({ ...p, [orderId]: null }));
+        setStockByComboByOrder((p) => ({ ...p, [orderId]: {} }));
         return;
       }
 
-      const gid = groups[0].id;
-
-      // opções P/M/G/GG
-      const { data: odata, error: oerr } = await supabase
-        .from("variant_options")
-        .select("id, variant_group_id, value")
-        .eq("variant_group_id", gid)
-        .in("value", SIZE_LABELS);
-      if (oerr) throw oerr;
-      const options = (odata ?? []) as VariantOptionRow[];
-      const optionIds = options.map((o) => o.id);
-
-      let sizes: SizeEntry[] = [];
-      if (optionIds.length) {
-        const { data: pv, error: pvErr } = await supabase
-          .from("product_variants")
-          .select("product_id, variant_option_id, amount")
-          .eq("product_id", product.id)
-          .in("variant_option_id", optionIds);
-        if (pvErr) throw pvErr;
-
-        const stock = (pv ?? []) as PVRow[];
-
-        sizes = SIZE_LABELS.map((label) => {
-          const opt = options.find((o) => o.value === label) || null;
-          const optionId = opt?.id ?? "";
-          const amount =
-            stock.find((s) => s.variant_option_id === optionId)?.amount ?? 0;
-          return { key: label, optionId, amount };
-        }).filter((e) => e.optionId);
+      // Opções de tamanho (P/M/G/GG)
+      let sizeOptions: VariantOptionRow[] = [];
+      if (sizeGroup) {
+        const { data: odata, error: oerr } = await supabase
+          .from("variant_options")
+          .select("id, variant_group_id, value, position")
+          .eq("variant_group_id", sizeGroup.id)
+          .in("value", SIZE_LABELS)
+          .order("position", { ascending: true });
+        if (oerr) throw oerr;
+        sizeOptions = (odata ?? []) as VariantOptionRow[];
       }
 
-      setSizesByOrder((prev) => ({ ...prev, [orderId]: sizes }));
+      // Opções de cor (se houver)
+      let colorOptions: ColorEntry[] = [];
+      if (colorGroup) {
+        const { data: cdata, error: cerr } = await supabase
+          .from("variant_options")
+          .select("id, value, position")
+          .eq("variant_group_id", colorGroup.id)
+          .order("position", { ascending: true });
+        if (cerr) throw cerr;
+        const rows = (cdata ?? []) as { id: string; value: string; position?: number }[];
+        colorOptions = rows.map((r) => ({ id: r.id, name: r.value }));
+      }
 
-      // pré-seleção: único tamanho com estoque > 0
+      // Apenas tamanho → usar product_variants
+      if (sizeGroup && !colorGroup) {
+        const sizeIds = sizeOptions.map((o) => o.id);
+        let sizes: SizeEntry[] = [];
+        if (sizeIds.length) {
+          const { data: pv, error: pvErr } = await supabase
+            .from("product_variants")
+            .select("product_id, variant_option_id, amount")
+            .eq("product_id", product.id)
+            .in("variant_option_id", sizeIds);
+          if (pvErr) throw pvErr;
+
+          const stock = (pv ?? []) as PVRow[];
+          sizes = SIZE_LABELS.map((label) => {
+            const opt = sizeOptions.find((o) => o.value === label) || null;
+            const optionId = opt?.id ?? "";
+            const amount = stock.find((s) => s.variant_option_id === optionId)?.amount ?? 0;
+            return { key: label as SizeKey, optionId, amount };
+          }).filter((e) => e.optionId);
+        }
+
+        setSizesByOrder((p) => ({ ...p, [orderId]: sizes }));
+        const withStock = sizes.filter((s) => s.amount > 0);
+        setSelectedSizeByOrder((p) => ({ ...p, [orderId]: withStock.length === 1 ? withStock[0].key : null }));
+        setColorsByOrder((p) => ({ ...p, [orderId]: [] }));
+        setSelectedColorByOrder((p) => ({ ...p, [orderId]: null }));
+        setStockByComboByOrder((p) => ({ ...p, [orderId]: {} }));
+        return;
+      }
+
+      // Tamanho + Cor → usar product_variant_sets para montar a matriz
+      const sizeIds = sizeOptions.map((o) => o.id);
+      const colorIds = colorOptions.map((c) => c.id);
+
+      const { data: sets, error: setsErr } = await supabase
+        .from("product_variant_sets")
+        .select("amount, product_variant_set_options(variant_option_id)")
+        .eq("product_id", product.id);
+      if (setsErr) throw setsErr;
+
+      const setRows = (sets ?? []) as VariantSetRow[];
+
+      const sumBySize = new Map<string, number>();
+      const stockByCombo: Record<string, number> = {};
+
+      for (const s of setRows) {
+        const optIds = (s.product_variant_set_options || []).map((o) => o.variant_option_id);
+        const sizeId = optIds.find((id) => sizeIds.includes(id));
+        const colorId = optIds.find((id) => colorIds.includes(id));
+        const amt = Number(s.amount ?? 0);
+
+        if (sizeId) sumBySize.set(sizeId, (sumBySize.get(sizeId) ?? 0) + amt);
+        if (sizeId && colorId) {
+          const key = `${sizeId}::${colorId}`;
+          stockByCombo[key] = (stockByCombo[key] ?? 0) + amt;
+        }
+      }
+
+      const sizes: SizeEntry[] = SIZE_LABELS.map((label) => {
+        const opt = sizeOptions.find((o) => o.value === label) || null;
+        const optionId = opt?.id ?? "";
+        const amount = Number(sumBySize.get(optionId) ?? 0);
+        return { key: label as SizeKey, optionId, amount };
+      }).filter((e) => e.optionId);
+
+      setSizesByOrder((p) => ({ ...p, [orderId]: sizes }));
       const withStock = sizes.filter((s) => s.amount > 0);
-      setSelectedSizeByOrder((prev) => ({
-        ...prev,
-        [orderId]: withStock.length === 1 ? withStock[0].key : null,
-      }));
+      setSelectedSizeByOrder((p) => ({ ...p, [orderId]: withStock.length === 1 ? withStock[0].key : null }));
+      setColorsByOrder((p) => ({ ...p, [orderId]: colorOptions }));
+      setSelectedColorByOrder((p) => ({ ...p, [orderId]: colorOptions.length === 1 ? colorOptions[0].id : null }));
+      setStockByComboByOrder((p) => ({ ...p, [orderId]: stockByCombo }));
     } catch (e) {
-      setErr(e instanceof Error ? e.message : "Erro ao carregar tamanhos do produto");
-      setSizesByOrder((prev) => ({ ...prev, [orderId]: [] }));
-      setSelectedSizeByOrder((prev) => ({ ...prev, [orderId]: null }));
+      setErr(e instanceof Error ? e.message : "Erro ao carregar variações do produto");
+      setSizesByOrder((p) => ({ ...p, [orderId]: [] }));
+      setSelectedSizeByOrder((p) => ({ ...p, [orderId]: null }));
+      setColorsByOrder((p) => ({ ...p, [orderId]: [] }));
+      setSelectedColorByOrder((p) => ({ ...p, [orderId]: null }));
+      setStockByComboByOrder((p) => ({ ...p, [orderId]: {} }));
     }
+  }
+
+  /* ============ Helper: quantidade por combinação (pedido específico) ============ */
+  function comboQtyForOrder(orderId: number, sizeId: string | null, colorId: string | null): number {
+    const stockByCombo = stockByComboByOrder[orderId] || {};
+    const hasMatrix = Object.keys(stockByCombo).length > 0;
+    if (!hasMatrix) return 0;
+
+    if (sizeId && colorId) {
+      return Math.max(0, stockByCombo[`${sizeId}::${colorId}`] ?? 0);
+    }
+    if (sizeId && !colorId) {
+      let sum = 0;
+      for (const k of Object.keys(stockByCombo)) {
+        if (k.startsWith(`${sizeId}::`)) sum += stockByCombo[k];
+      }
+      return Math.max(0, sum);
+    }
+    if (!sizeId && colorId) {
+      let sum = 0;
+      for (const k of Object.keys(stockByCombo)) {
+        if (k.endsWith(`::${colorId}`)) sum += stockByCombo[k];
+      }
+      return Math.max(0, sum);
+    }
+    return Object.values(stockByCombo).reduce((s, n) => s + n, 0);
   }
 
   // Adicionar item selecionado ao pedido (somente pendente)
@@ -373,12 +509,12 @@ export default function OrdersPage() {
       if (pErr) throw pErr;
       if (!prod) throw new Error("Produto não encontrado");
 
-      // Verifica se há variantes carregadas para este pedido/produto
       const sizes = sizesByOrder[order.id] ?? [];
-      const hasVariants = sizes.length > 0;
+      const hasSizes = sizes.length > 0;
+      const colors = colorsByOrder[order.id] ?? [];
+      const hasColors = colors.length > 0;
 
-      if (hasVariants) {
-        // exige seleção de tamanho
+      if (hasSizes) {
         const sel = selectedSizeByOrder[order.id];
         if (!sel) {
           setErr("Selecione um tamanho para adicionar este produto.");
@@ -389,14 +525,42 @@ export default function OrdersPage() {
           setErr("Tamanho inválido para este produto.");
           return;
         }
+        const sizeId = entry.optionId;
 
-        const payload = {
+        let colorId: string | null = null;
+        let colorLabel: string | null = null;
+
+        if (hasColors) {
+          colorId = selectedColorByOrder[order.id] ?? null;
+          if (!colorId) {
+            setErr("Selecione uma cor.");
+            return;
+          }
+          // Bloqueio por combinação sem estoque:
+          const q = comboQtyForOrder(order.id, sizeId, colorId);
+          if (q <= 0) {
+            setErr("Sem estoque para essa combinação Tamanho × Cor.");
+            return;
+          }
+          const c = colors.find((cc) => cc.id === colorId);
+          colorLabel = c ? c.name : null;
+        } else {
+          // tamanho apenas: bloqueia se estoque do tamanho for 0
+          if ((entry.amount ?? 0) <= 0) {
+            setErr("Tamanho esgotado.");
+            return;
+          }
+        }
+
+        const payload: OrderItemInsert = {
           order_id: order.id,
           product_id: prod.id,
-          variant_option_id: entry.optionId,
+          variant_option_id: sizeId,
           size_label: sel,
           quantity: qty,
           price_cents: prod.price_cents,
+          color_option_id: hasColors ? colorId ?? null : undefined,
+          color_label: hasColors ? colorLabel ?? null : undefined,
         };
 
         const { data: inserted, error: iErr } = await supabase
@@ -406,14 +570,15 @@ export default function OrdersPage() {
           .single<{ id: number }>();
         if (iErr) throw iErr;
 
-        // Atualiza UI
         const newItem: OrderItemRow = {
           id: inserted.id,
           order_id: order.id,
           quantity: qty,
           price_cents: prod.price_cents,
           size_label: sel,
-          variant_option_id: entry.optionId,
+          variant_option_id: sizeId,
+          color_option_id: hasColors ? colorId ?? null : null,
+          color_label: hasColors ? colorLabel ?? null : null,
           product: { id: prod.id, title: prod.title },
         };
         setItemsByOrder((prev) => {
@@ -421,8 +586,14 @@ export default function OrdersPage() {
           return { ...prev, [order.id]: [...current, newItem] };
         });
       } else {
-        // Sem variação
-        const payload = {
+        // Sem variação (produto simples)
+        const baseAmt = prod.amount ?? 0;
+        if (baseAmt <= 0) {
+          setErr("Produto esgotado.");
+          return;
+        }
+
+        const payload: OrderItemInsert = {
           order_id: order.id,
           product_id: prod.id,
           quantity: qty,
@@ -443,6 +614,8 @@ export default function OrdersPage() {
           price_cents: prod.price_cents,
           size_label: null,
           variant_option_id: null,
+          color_option_id: null,
+          color_label: null,
           product: { id: prod.id, title: prod.title },
         };
         setItemsByOrder((prev) => {
@@ -467,6 +640,7 @@ export default function OrdersPage() {
     }
   }
 
+  /* ============ Componentes auxiliares ============ */
   function StatusBadge({ status }: { status: OrderRow["status"] }) {
     if (status === "approved")
       return (
@@ -487,6 +661,7 @@ export default function OrdersPage() {
     );
   }
 
+  /* ============ Render ============ */
   return (
     <div className="max-w-screen-xl mx-auto px-4">
       <header className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-4">
@@ -504,7 +679,7 @@ export default function OrdersPage() {
             <input
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              placeholder="Buscar por #código"
+              placeholder="Buscar por #código, nome ou telefone"
               className="w-72 px-3 py-2 rounded-xl border border-gray-200"
             />
             <Search className="w-4 h-4 text-gray-500 absolute right-2 top-1/2 -translate-y-1/2" />
@@ -531,7 +706,7 @@ export default function OrdersPage() {
       )}
 
       <div className="rounded-2xl border border-gray-100 overflow-hidden">
-        <div className="grid grid-cols-[120px_1fr_140px_110px_160px] gap-0 bg-gray-50 px-3 py-2 text-xs font-medium text-gray-600">
+        <div className="grid grid-cols-[140px_1fr_180px_160px_160px] gap-0 bg-gray-50 px-3 py-2 text-xs font-medium text-gray-600">
           <div>Código</div>
           <div>Total</div>
           <div>Status</div>
@@ -559,25 +734,35 @@ export default function OrdersPage() {
               const hasVariants = sizes.length > 0;
               const selSize = selectedSizeByOrder[r.id] ?? null;
 
-              // Avisos: para produto sem variação usamos amount base,
-              // para produto com variação mostramos o estoque do tamanho selecionado (se houver)
-              const baseAmount = selected?.amount ?? null;
-              const selectedSizeStock =
-                selSize && sizes.find((s) => s.key === selSize)?.amount;
+              const colors = colorsByOrder[r.id] ?? [];
+              const hasColors = colors.length > 0;
+              const selColorId = selectedColorByOrder[r.id] ?? null;
 
-              const outStock =
-                hasVariants
-                  ? (selectedSizeStock ?? 0) <= 0
-                  : (baseAmount ?? 0) <= 0;
-              const lowStock =
-                hasVariants
-                  ? typeof selectedSizeStock === "number" && selectedSizeStock > 0 && selectedSizeStock < 10
-                  : typeof baseAmount === "number" && baseAmount > 0 && baseAmount < 10;
+              // Avisos de estoque (informativos)
+              const baseAmount = selected?.amount ?? null;
+              const selectedSizeStock = selSize ? sizes.find((s) => s.key === selSize)?.amount : undefined;
+              const sizeIdForCombo = selSize ? sizes.find((s) => s.key === selSize)?.optionId ?? null : null;
+              const comboStock =
+                hasColors && selColorId && sizeIdForCombo
+                  ? comboQtyForOrder(r.id, sizeIdForCombo, selColorId)
+                  : undefined;
+
+              const outStock = hasVariants
+                ? hasColors
+                  ? typeof comboStock === "number" && comboStock <= 0
+                  : (selectedSizeStock ?? 0) <= 0
+                : (baseAmount ?? 0) <= 0;
+
+              const lowStock = hasVariants
+                ? hasColors
+                  ? typeof comboStock === "number" && comboStock > 0 && comboStock < 10
+                  : typeof selectedSizeStock === "number" && selectedSizeStock > 0 && selectedSizeStock < 10
+                : typeof baseAmount === "number" && baseAmount > 0 && baseAmount < 10;
 
               return (
                 <li key={r.id} className="px-3 py-3">
                   {/* Linha principal */}
-                  <div className="grid grid-cols-[120px_1fr_140px_110px_160px] items-center gap-2">
+                  <div className="grid grid-cols-[140px_1fr_180px_160px_160px] items-center gap-2">
                     <button
                       onClick={() => toggleExpand(r.id)}
                       className="inline-flex items-center gap-1 text-sm font-medium"
@@ -595,7 +780,7 @@ export default function OrdersPage() {
                       {formatBRL(r.total_cents)}
                     </div>
 
-                    <div>
+                    <div className="flex items-center">
                       <StatusBadge status={r.status} />
                     </div>
 
@@ -658,6 +843,13 @@ export default function OrdersPage() {
                                       {it.size_label ? (
                                         <span className="ml-1 text-xs text-gray-500">
                                           • Tam: <b>{it.size_label}</b>
+                                          {it.color_label ? (
+                                            <> • Cor: <b>{it.color_label}</b></>
+                                          ) : null}
+                                        </span>
+                                      ) : it.color_label ? (
+                                        <span className="ml-1 text-xs text-gray-500">
+                                          • Cor: <b>{it.color_label}</b>
                                         </span>
                                       ) : null}
                                     </span>
@@ -689,7 +881,7 @@ export default function OrdersPage() {
                               Adicionar item ao pedido
                             </div>
 
-                            <div className="flex flex-col md:flex-row gap-2 md:items-end">
+                            <div className="flex flex-col md:flex-row md:items-end gap-2">
                               {/* Buscar produto */}
                               <div className="flex-1">
                                 <label className="text-xs text-gray-600">Buscar produto</label>
@@ -728,7 +920,7 @@ export default function OrdersPage() {
                                               ${isSelected ? "bg-emerald-50" : "hover:bg-gray-50"}`}
                                             onClick={() => {
                                               setSelectedProductByOrder((prev) => ({ ...prev, [r.id]: p }));
-                                              // ao selecionar um produto, carrega suas variantes de tamanho (se houver)
+                                              // ao selecionar um produto, carrega suas variações (tamanho/cor) se houver
                                               loadSizesForSelected(r.id, p);
                                             }}
                                           >
@@ -753,11 +945,12 @@ export default function OrdersPage() {
                                       const entry = sizes.find((s) => s.key === sz);
                                       const exists = Boolean(entry);
                                       const active = selSize === sz;
+                                      const disabled = !exists || (entry ? entry.amount <= 0 : true);
                                       return (
                                         <button
                                           key={sz}
                                           type="button"
-                                          disabled={!exists}
+                                          disabled={disabled}
                                           onClick={() =>
                                             setSelectedSizeByOrder((prev) => ({ ...prev, [r.id]: sz }))
                                           }
@@ -774,6 +967,35 @@ export default function OrdersPage() {
                                           }
                                         >
                                           {sz}
+                                        </button>
+                                      );
+                                    })}
+                                  </div>
+                                </div>
+                              )}
+
+                              {/* Se houver cores, mostra seletor de cor */}
+                              {hasVariants && colors.length > 0 && (
+                                <div className="w-full md:w-52">
+                                  <label className="text-xs text-gray-600">Cor</label>
+                                  <div className="flex flex-wrap gap-1">
+                                    {colors.map((c) => {
+                                      const active = selColorId === c.id;
+                                      const sizeId = selSize ? sizes.find((s) => s.key === selSize)?.optionId ?? null : null;
+                                      const disabled = selSize ? comboQtyForOrder(r.id, sizeId, c.id) <= 0 : true; // exige tamanho primeiro
+                                      return (
+                                        <button
+                                          key={c.id}
+                                          type="button"
+                                          disabled={disabled}
+                                          onClick={() => setSelectedColorByOrder((prev) => ({ ...prev, [r.id]: c.id }))}
+                                          className={`px-2.5 py-1 rounded-full border text-xs ${
+                                            active ? "text-white border-transparent" : "text-gray-700 border-gray-200 bg-gray-50"
+                                          } disabled:opacity-40 disabled:cursor-not-allowed`}
+                                          style={active ? { backgroundColor: ACCENT } : {}}
+                                          title={c.name}
+                                        >
+                                          {c.name}
                                         </button>
                                       );
                                     })}
@@ -807,7 +1029,8 @@ export default function OrdersPage() {
                                     !canMutate ||
                                     !selected ||
                                     adding ||
-                                    (hasVariants && !selSize)
+                                    (hasVariants && !selSize) ||
+                                    (hasVariants && colors.length > 0 && !selColorId)
                                   }
                                   className="w-full md:w-auto inline-flex items-center gap-2 px-4 py-2 rounded-xl text-white disabled:opacity-50"
                                   style={{ backgroundColor: ACCENT }}
@@ -819,18 +1042,22 @@ export default function OrdersPage() {
                                   )}
                                   Adicionar
                                 </button>
-                                {/* Avisos de estoque (não bloqueiam) */}
+                                {/* Avisos de estoque (não bloqueiam a UI — o bloqueio ocorre no add) */}
                                 {selected && outStock && (
                                   <div className="mt-1 text-[11px] text-red-700">
                                     {hasVariants
-                                      ? "Tamanho esgotado — ajuste o estoque da variante antes de aprovar."
-                                      : "Produto esgotado — ajuste o estoque antes de aprovar."}
+                                      ? (hasColors
+                                          ? "Combinação Tamanho × Cor esgotada — ajuste o estoque da combinação."
+                                          : "Tamanho esgotado — ajuste o estoque da variante.")
+                                      : "Produto esgotado — ajuste o estoque."}
                                   </div>
                                 )}
                                 {selected && lowStock && !outStock && (
                                   <div className="mt-1 text-[11px] text-orange-700">
                                     {hasVariants
-                                      ? `Estoque baixo para ${selSize ?? ""} (${selectedSizeStock ?? 0} un.)`
+                                      ? (hasColors
+                                          ? `Estoque baixo para a combinação selecionada (${comboStock ?? 0} un.)`
+                                          : `Estoque baixo para ${selSize ?? ""} (${selectedSizeStock ?? 0} un.)`)
                                       : `Estoque baixo (${selected.amount ?? 0} un.)`}
                                   </div>
                                 )}

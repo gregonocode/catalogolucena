@@ -12,8 +12,14 @@ import {
   GripVertical,
   Shirt,
   Package2,
+  Droplet,
+  ChevronDown,
+  ChevronRight,
+  ArrowRight,
+  AlertTriangle,
 } from "lucide-react";
 import { supabaseBrowser } from "@/lib/supabase-browser";
+import { VariantMatrix } from "./VariantMatrix"; // ajuste o path se necessário
 
 const ACCENT = "#01A920";
 
@@ -24,6 +30,12 @@ type VariantOption = { id: string; variant_group_id: string; value: string; code
 
 type SizeKey = "P" | "M" | "G" | "GG";
 const SIZE_LABELS: SizeKey[] = ["P", "M", "G", "GG"];
+
+// Helpers
+const norm = (s: string) => s.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+const isSizeName = (name: string) => norm(name) === "tamanho";
+const isColorName = (name: string) => norm(name) === "cor";
+const isValidHex = (v: string) => /^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(v);
 
 export default function VariantsPage() {
   const supabase = supabaseBrowser();
@@ -38,8 +50,9 @@ export default function VariantsPage() {
 
   const [err, setErr] = React.useState<string | null>(null);
   const [ok, setOk] = React.useState<string | null>(null);
+  const [warn, setWarn] = React.useState<string | null>(null);
 
-  // Estado de tamanhos/estoque
+  // Estado de tamanhos/estoque (modo antigo por tamanho)
   const [sizeGroupId, setSizeGroupId] = React.useState<string | null>(null);
   const [sizeOptionIds, setSizeOptionIds] = React.useState<Record<SizeKey, string | null>>({
     P: null,
@@ -69,6 +82,41 @@ export default function VariantsPage() {
     GG: false,
   });
   const [savingOne, setSavingOne] = React.useState<SizeKey | null>(null);
+
+  // --- Retrátil por grupo (persistido por produto) ---
+  const [collapsed, setCollapsed] = React.useState<Record<string, boolean>>({});
+
+  function loadCollapsed(pid: string) {
+    try {
+      const raw = typeof window !== "undefined" ? localStorage.getItem(`vx-collapsed:${pid}`) : null;
+      return raw ? (JSON.parse(raw) as Record<string, boolean>) : {};
+    } catch {
+      return {};
+    }
+  }
+  function saveCollapsed(pid: string, map: Record<string, boolean>) {
+    try {
+      if (typeof window !== "undefined") {
+        localStorage.setItem(`vx-collapsed:${pid}`, JSON.stringify(map));
+      }
+    } catch {}
+  }
+  React.useEffect(() => {
+    if (!productId) return;
+    setCollapsed(loadCollapsed(productId));
+  }, [productId]);
+
+  function toggleGroupCollapse(id: string) {
+    setCollapsed((prev) => {
+      const next = { ...prev, [id]: !prev[id] };
+      saveCollapsed(productId, next);
+      return next;
+    });
+  }
+
+  // --- Forçar refresh da Grade (VariantMatrix) ---
+  const [matrixRefresh, setMatrixRefresh] = React.useState(0);
+  const bumpMatrix = React.useCallback(() => setMatrixRefresh((v) => v + 1), []);
 
   // ---------------- Helpers base (carregar dados) ----------------
   async function reloadFor(
@@ -163,6 +211,8 @@ export default function VariantsPage() {
       (async () => {
         const fresh = await reloadFor(productId);
         await loadSizeStockForProduct(productId, fresh.groups, fresh.options);
+        setWarn(null);
+        bumpMatrix(); // recarrega Grade ao trocar de produto
       })();
     } else {
       setGroups([]);
@@ -177,11 +227,17 @@ export default function VariantsPage() {
     [groups, productId]
   );
 
+  // Se existir grupo "Cor", vamos esconder o editor de Qtd do grupo Tamanho
+  const hasColorGroup = React.useMemo(
+    () => productGroups.some((g) => isColorName(g.name)),
+    [productGroups]
+  );
+
   function nextGroupPosition(): number {
     return productGroups.length ? Math.max(...productGroups.map((g) => g.position)) + 1 : 0;
   }
 
-  // ---------------- Tamanhos: carregar/garantir ----------------
+  // ---------------- Tamanhos: carregar/garantir (modo antigo) ----------------
   function resetSizesUI() {
     setSizeGroupId(null);
     setSizeOptionIds({ P: null, M: null, G: null, GG: null });
@@ -203,17 +259,12 @@ export default function VariantsPage() {
     setErr(null);
 
     try {
-      const norm = (s: string) => s.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
-
-      // use dados frescos se fornecidos; caso contrário, caia para o state
       const gList = groupsArg ?? productGroups;
       const oList = optionsArg ?? options;
 
-      // localizar grupo "Tamanho"
-      const sizeGroup = gList.find((g) => norm(g.name) === "tamanho") ?? null;
+      const sizeGroup = gList.find((g) => isSizeName(g.name)) ?? null;
       setSizeGroupId(sizeGroup?.id ?? null);
 
-      // localizar opções P/M/G/GG
       const idMap: Record<SizeKey, string | null> = { P: null, M: null, G: null, GG: null };
       if (sizeGroup) {
         const szOpts = oList
@@ -226,7 +277,6 @@ export default function VariantsPage() {
       }
       setSizeOptionIds(idMap);
 
-      // buscar quantidades salvas
       const idsToLoad = Object.values(idMap).filter(Boolean) as string[];
 
       let pvArr: { variant_option_id: string; amount: number }[] = [];
@@ -239,7 +289,6 @@ export default function VariantsPage() {
         pvArr = (pvRows ?? []) as { variant_option_id: string; amount: number }[];
       }
 
-      // chip ativo se existe option; amount visível (0 se não houver linha)
       const amt: Record<SizeKey, number> = { P: 0, M: 0, G: 0, GG: 0 };
       const sel: Record<SizeKey, boolean> = { P: false, M: false, G: false, GG: false };
       for (const key of SIZE_LABELS) {
@@ -261,8 +310,7 @@ export default function VariantsPage() {
   }
 
   async function ensureSizeGroup(): Promise<string> {
-    const norm = (s: string) => s.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
-    const existing = productGroups.find((g) => norm(g.name) === "tamanho");
+    const existing = productGroups.find((g) => isSizeName(g.name));
     if (existing) return existing.id;
 
     const { data, error } = await supabase
@@ -274,7 +322,6 @@ export default function VariantsPage() {
 
     const fresh = await reloadFor(productId);
     setSizeGroupId(data.id);
-    // manter estado em sincronia
     await loadSizeStockForProduct(productId, fresh.groups, fresh.options);
     return data.id;
   }
@@ -296,7 +343,6 @@ export default function VariantsPage() {
     return data.id;
   }
 
-  // Toggle inline (cria/remove imediatamente)
   async function toggleSize(size: SizeKey) {
     if (!productId) return;
     setErr(null);
@@ -306,24 +352,20 @@ export default function VariantsPage() {
       const turningOn = !sizesSelected[size];
 
       if (turningOn) {
-        // cria grupo (se faltar) e option para esse tamanho
         const gid = await ensureSizeGroup();
         const optId = await ensureOneSizeOption(gid, size);
 
-        // upsert product_variants com quantidade atual (ou 0)
         const amount = Math.max(0, Math.trunc(Number(sizesAmount[size] ?? 0)));
         const { error: upErr } = await supabase
           .from("product_variants")
           .upsert({ product_id: productId, variant_option_id: optId, amount }, { onConflict: "product_id,variant_option_id" });
         if (upErr) throw upErr;
 
-        // atualizar estados locais (imediato)
         setSizesSelected((p) => ({ ...p, [size]: true }));
         setSizeOptionIds((p) => ({ ...p, [size]: optId }));
 
         setOk(`Tamanho ${size} criado.`);
       } else {
-        // desativar: remover product_variants + variant_option
         const optId = sizeOptionIds[size];
         if (optId) {
           const { error: delPvErr } = await supabase
@@ -341,19 +383,20 @@ export default function VariantsPage() {
         setSizesAmount((p) => ({ ...p, [size]: 0 }));
         setSizeOptionIds((p) => ({ ...p, [size]: null }));
 
-        // recarrega e aplica na UI usando dados frescos
         await reloadFor(productId).then(({ groups: gArr, options: oArr }) =>
           loadSizeStockForProduct(productId, gArr, oArr)
         );
 
         setOk(`Tamanho ${size} removido.`);
       }
+
+      // se já existir Cor, a Grade depende disso → atualiza
+      if (hasColorGroup) bumpMatrix();
     } catch (e) {
       setErr(e instanceof Error ? e.message : "Erro ao alternar tamanho");
     }
   }
 
-  // Salvar apenas 1 quantidade (inline)
   async function saveSingleSize(size: SizeKey) {
     if (!productId) return;
     const optId = sizeOptionIds[size];
@@ -374,6 +417,8 @@ export default function VariantsPage() {
 
       setEditing((prev) => ({ ...prev, [size]: false }));
       setOk(`Estoque de ${size} atualizado.`);
+
+      if (hasColorGroup) bumpMatrix();
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Erro ao salvar quantidade";
       setErr(msg);
@@ -382,7 +427,95 @@ export default function VariantsPage() {
     }
   }
 
-  // ---------------- CRUD básico de grupos/opções (outros grupos) ----------------
+  // ---------------- COR: ativar grupo + migração opcional ----------------
+
+  async function ensureColorGroup(): Promise<string> {
+    const existing = productGroups.find((g) => isColorName(g.name));
+    if (existing) return existing.id;
+
+    const { data, error } = await supabase
+      .from("variant_groups")
+      .insert({ product_id: productId, name: "Cor", position: nextGroupPosition() })
+      .select("id, product_id, name, position")
+      .single<VariantGroup>();
+    if (error) throw error;
+
+    const fresh = await reloadFor(productId);
+    return data.id || fresh.groups.find((g) => isColorName(g.name))?.id!;
+  }
+
+  async function createColorOption(colorGroupId: string, name: string, hex: string) {
+    const count = options.filter((o) => o.variant_group_id === colorGroupId).length;
+    const { data, error } = await supabase
+      .from("variant_options")
+      .insert({
+        variant_group_id: colorGroupId,
+        value: name.trim(),
+        code: hex.trim(),
+        position: count,
+      })
+      .select("id")
+      .single<{ id: string }>();
+    if (error) throw error;
+    return data.id;
+  }
+
+  async function migrateSizeStockToSets(targetColorOptId: string) {
+    const szMapEntries = Object.entries(sizeOptionIds).filter(([, v]) => v) as [SizeKey, string][];
+    if (szMapEntries.length === 0) {
+      setWarn("Nenhum tamanho encontrado para migrar.");
+      return;
+    }
+    const { data: pvRows, error: pvErr } = await supabase
+      .from("product_variants")
+      .select("variant_option_id, amount")
+      .eq("product_id", productId)
+      .in(
+        "variant_option_id",
+        szMapEntries.map(([, id]) => id)
+      );
+    if (pvErr) throw pvErr;
+
+    const byOption = new Map<string, number>();
+    (pvRows ?? []).forEach((r: any) => {
+      byOption.set(r.variant_option_id, Number(r.amount ?? 0));
+    });
+
+    for (const [, sizeOptId] of szMapEntries) {
+      const amt = byOption.get(sizeOptId) ?? 0;
+      if (amt <= 0) continue;
+
+      const { data: setRow, error: setErr } = await supabase
+        .from("product_variant_sets")
+        .insert({ product_id: productId, amount: amt })
+        .select("id")
+        .single<{ id: string }>();
+      if (setErr) throw setErr;
+
+      const setId = setRow.id;
+
+      const { error: linkErr } = await supabase
+        .from("product_variant_set_options")
+        .insert([
+          { product_variant_set_id: setId, variant_option_id: sizeOptId },
+          { product_variant_set_id: setId, variant_option_id: targetColorOptId },
+        ]);
+      if (linkErr) throw linkErr;
+    }
+
+    // zera product_variants para não somar em dobro
+    const { error: zeroErr } = await supabase
+      .from("product_variants")
+      .update({ amount: 0 })
+      .eq("product_id", productId)
+      .in(
+        "variant_option_id",
+        szMapEntries.map(([, id]) => id)
+      );
+    if (zeroErr) throw zeroErr;
+  }
+
+  // ---------------- CRUD básico de grupos/opções ----------------
   function startEditGroup(id: string) {
     setGroups((prev) => prev.map((g) => (g.id === id ? { ...g, _editing: true } : g)));
   }
@@ -412,6 +545,7 @@ export default function VariantsPage() {
       const fresh = await reloadFor(productId);
       if (id === sizeGroupId) resetSizesUI();
       await loadSizeStockForProduct(productId, fresh.groups, fresh.options);
+      bumpMatrix(); // pode impactar a Grade
     } catch (e) {
       setErr(e instanceof Error ? e.message : "Erro ao remover grupo");
     }
@@ -428,9 +562,9 @@ export default function VariantsPage() {
       });
       if (error) throw error;
 
-      await reloadFor(productId).then(({ groups: gArr, options: oArr }) =>
-        loadSizeStockForProduct(productId, gArr, oArr)
-      );
+      const fresh = await reloadFor(productId);
+      await loadSizeStockForProduct(productId, fresh.groups, fresh.options);
+      bumpMatrix();
     } catch (e) {
       setErr(e instanceof Error ? e.message : "Erro ao adicionar opção");
     }
@@ -443,9 +577,9 @@ export default function VariantsPage() {
         .eq("id", optId);
       if (error) throw error;
 
-      await reloadFor(productId).then(({ groups: gArr, options: oArr }) =>
-        loadSizeStockForProduct(productId, gArr, oArr)
-      );
+      const fresh = await reloadFor(productId);
+      await loadSizeStockForProduct(productId, fresh.groups, fresh.options);
+      bumpMatrix();
     } catch (e) {
       setErr(e instanceof Error ? e.message : "Erro ao salvar opção");
     }
@@ -456,9 +590,9 @@ export default function VariantsPage() {
       const { error } = await supabase.from("variant_options").delete().eq("id", optId);
       if (error) throw error;
 
-      await reloadFor(productId).then(({ groups: gArr, options: oArr }) =>
-        loadSizeStockForProduct(productId, gArr, oArr)
-      );
+      const fresh = await reloadFor(productId);
+      await loadSizeStockForProduct(productId, fresh.groups, fresh.options);
+      bumpMatrix();
     } catch (e) {
       setErr(e instanceof Error ? e.message : "Erro ao remover opção");
     }
@@ -470,7 +604,7 @@ export default function VariantsPage() {
       <div className="flex items-center justify-between mb-4">
         <h1 className="text-lg font-semibold">Variantes</h1>
         <span className="inline-flex items-center gap-1 text-xs text-gray-500">
-          <Layers3 className="w-4 h-4" /> Tamanho (P, M, G, GG)
+          <Layers3 className="w-4 h-4" /> Tamanho (P, M, G, GG) • Cor (nome + hex)
         </span>
       </div>
 
@@ -496,7 +630,7 @@ export default function VariantsPage() {
         </div>
       </div>
 
-      {/* CARD — Chips criam/removem na hora */}
+      {/* CARD — Chips criam/removem na hora (Tamanho) */}
       <section className="mb-6 rounded-2xl border border-gray-100 bg-white shadow-sm overflow-hidden">
         <header className="flex items-center justify-between px-3 py-2 border-b border-gray-100">
           <div className="flex items-center gap-2">
@@ -515,7 +649,12 @@ export default function VariantsPage() {
           ) : (
             <>
               <div className="mb-2 text-xs text-gray-500">
-                Clique no tamanho para <b>criar/remover</b>. Edite a <b>quantidade</b> na lista do grupo <b>Tamanho</b> abaixo.
+                Clique no tamanho para <b>criar/remover</b>.{" "}
+                {hasColorGroup ? (
+                  <>Como este produto tem <b>Cor</b>, o estoque por combinação é editado na <b>Grade</b> abaixo.</>
+                ) : (
+                  <>Edite a <b>quantidade</b> na lista do grupo <b>Tamanho</b> abaixo.</>
+                )}
               </div>
               <div className="flex flex-wrap gap-2">
                 {SIZE_LABELS.map((sz) => {
@@ -541,7 +680,19 @@ export default function VariantsPage() {
         </div>
       </section>
 
-      {/* Lista de grupos/opções existentes */}
+      {/* === Grade Tamanho × Cor === */}
+      <div className="mb-6">
+        <VariantMatrix productId={productId} accent={ACCENT} refreshToken={matrixRefresh} />
+      </div>
+
+      {/* Lista de grupos/opções existentes (retrátil) */}
+      {warn && (
+        <div className="mb-3 px-3 py-2 rounded-xl bg-amber-50 border border-amber-200 text-amber-800 text-sm flex items-start gap-2">
+          <AlertTriangle className="w-4 h-4 mt-0.5" />
+          <div>{warn}</div>
+        </div>
+      )}
+
       {loadingData ? (
         <div className="p-3 rounded-xl border border-gray-100 bg-gray-50 text-sm text-gray-600">Carregando...</div>
       ) : (
@@ -552,62 +703,125 @@ export default function VariantsPage() {
             </div>
           ) : null}
 
-          {productGroups.map((g) => (
-            <section key={g.id} className="rounded-2xl border border-gray-100 bg-white shadow-sm overflow-hidden">
-              <header className="flex items-center justify-between px-3 py-2 border-b border-gray-100">
-                <div className="flex items-center gap-2">
-                  <span className="grid place-items-center w-7 h-7 rounded-md bg-gray-100 border border-gray-200">
-                    <GripVertical className="w-4 h-4 text-gray-600" />
-                  </span>
-                  {g._editing ? (
-                    <GroupEditInline
-                      name={g.name}
-                      onCancel={() => cancelEditGroup(g.id)}
-                      onSave={(name) => saveEditGroup(g.id, name)}
-                    />
-                  ) : (
-                    <h2 className="text-sm font-medium">{g.name}</h2>
-                  )}
-                </div>
-                <div className="flex items-center gap-1.5">
-                  {g._editing ? null : (
+          {productGroups.map((g) => {
+            const size = g.id === sizeGroupId;
+            const color = isColorName(g.name);
+            return (
+              <section key={g.id} className="rounded-2xl border border-gray-100 bg-white shadow-sm overflow-hidden">
+                <header className="flex items-center justify-between px-3 py-2 border-b border-gray-100">
+                  <div className="flex items-center gap-2">
+                    {/* Botão retrátil */}
                     <button
-                      onClick={() => startEditGroup(g.id)}
-                      className="px-2 py-1 rounded-lg border border-gray-200 text-xs bg-white"
+                      type="button"
+                      onClick={() => toggleGroupCollapse(g.id)}
+                      className="grid place-items-center w-7 h-7 rounded-md border border-gray-200 bg-white hover:bg-gray-50"
+                      title={collapsed[g.id] ? "Expandir" : "Recolher"}
                     >
-                      <Pencil className="w-4 h-4" />
+                      {collapsed[g.id] ? (
+                        <ChevronRight className="w-4 h-4 text-gray-600" />
+                      ) : (
+                        <ChevronDown className="w-4 h-4 text-gray-600" />
+                      )}
                     </button>
-                  )}
-                  <button
-                    onClick={() => removeGroup(g.id)}
-                    className="px-2 py-1 rounded-lg border border-gray-200 text-xs bg-white"
-                  >
-                    <Trash2 className="w-4 h-4" />
-                  </button>
-                </div>
-              </header>
 
-              <OptionsList
-                groupId={g.id}
-                isSizeGroup={g.id === sizeGroupId}
-                options={options
-                  .filter((o) => o.variant_group_id === g.id)
-                  .sort((a, b) => a.position - b.position)}
-                onAdd={addOption}
-                onSave={saveOption}
-                onDelete={deleteOption}
-                amountBySize={sizesAmount}
-                onAmountChange={(sz, val) =>
-                  setSizesAmount((prev) => ({ ...prev, [sz]: Math.max(0, Math.trunc(val)) }))
-                }
-                editingBySize={editing}
-                onStartEditSize={(sz) => setEditing((prev) => ({ ...prev, [sz]: true }))}
-                onSaveSingleSize={saveSingleSize}
-                savingOne={savingOne}
-              />
-            </section>
-          ))}
+                    {/* Ícone do grupo */}
+                    <span className="grid place-items-center w-7 h-7 rounded-md bg-gray-100 border border-gray-200">
+                      {color ? <Droplet className="w-4 h-4 text-gray-600" /> : <GripVertical className="w-4 h-4 text-gray-600" />}
+                    </span>
+
+                    {/* Título / edição inline */}
+                    {g._editing ? (
+                      <GroupEditInline
+                        name={g.name}
+                        onCancel={() => cancelEditGroup(g.id)}
+                        onSave={(name) => saveEditGroup(g.id, name)}
+                      />
+                    ) : (
+                      <h2 className="text-sm font-medium">
+                        {g.name} {color && <span className="text-xs text-gray-500">(nome + hex)</span>}
+                      </h2>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    {g._editing ? null : (
+                      <button
+                        onClick={() => startEditGroup(g.id)}
+                        className="px-2 py-1 rounded-lg border border-gray-200 text-xs bg-white"
+                        title="Renomear grupo"
+                      >
+                        <Pencil className="w-4 h-4" />
+                      </button>
+                    )}
+                    <button
+                      onClick={() => removeGroup(g.id)}
+                      className="px-2 py-1 rounded-lg border border-gray-200 text-xs bg-white"
+                      title="Excluir grupo"
+                    >
+                      <Trash2 className="w-4 h-4" />
+                    </button>
+                  </div>
+                </header>
+
+                {/* Corpo do card: retrátil */}
+                {!collapsed[g.id] && (
+                  <OptionsList
+                    groupId={g.id}
+                    isSizeGroup={size}
+                    isColorGroup={color}
+                    options={options
+                      .filter((o) => o.variant_group_id === g.id)
+                      .sort((a, b) => a.position - b.position)}
+                    onAdd={addOption}
+                    onSave={saveOption}
+                    onDelete={deleteOption}
+                    amountBySize={sizesAmount}
+                    onAmountChange={(sz, val) =>
+                      setSizesAmount((prev) => ({ ...prev, [sz]: Math.max(0, Math.trunc(val)) }))
+                    }
+                    editingBySize={editing}
+                    onStartEditSize={(sz) => setEditing((prev) => ({ ...prev, [sz]: true }))}
+                    onSaveSingleSize={saveSingleSize}
+                    savingOne={savingOne}
+                    setGlobalErr={setErr}
+                    hideSizeQty={hasColorGroup} // esconde Qtd do grupo Tamanho quando houver Cor
+                  />
+                )}
+              </section>
+            );
+          })}
         </div>
+      )}
+
+      {/* === Card de Ativar Cor no rodapé (apenas quando ainda não existe) === */}
+      {!hasColorGroup && productId && (
+        <ActivateColorCard
+          accent={ACCENT}
+          onActivate={async ({ colorName, colorHex, migrate }) => {
+            setErr(null);
+            setOk(null);
+            setWarn(null);
+            try {
+              if (!isValidHex(colorHex)) throw new Error("Informe um HEX válido (#RGB ou #RRGGBB).");
+              const colorGroupId = await ensureColorGroup();
+              const colorOptId = await createColorOption(colorGroupId, colorName || "Cor única", colorHex);
+
+              // recarrega grupos/opções
+              const fresh = await reloadFor(productId);
+              await loadSizeStockForProduct(productId, fresh.groups, fresh.options);
+
+              if (migrate) {
+                await migrateSizeStockToSets(colorOptId);
+                setOk("Variante 'Cor' ativada e estoque migrado para Tamanho × Cor.");
+              } else {
+                setOk("Variante 'Cor' ativada. Agora adicione combinações na Grade.");
+              }
+
+              bumpMatrix(); // força a Grade a refazer o fetch
+            } catch (e) {
+              setErr(e instanceof Error ? e.message : "Falha ao ativar variante de cor");
+            }
+          }}
+        />
       )}
 
       {(ok || err) && (
@@ -617,6 +831,97 @@ export default function VariantsPage() {
         </div>
       )}
     </div>
+  );
+}
+
+/** Card de "Ativar Cor" com primeira cor + opção de migração */
+function ActivateColorCard({
+  accent,
+  onActivate,
+}: {
+  accent: string;
+  onActivate: (args: { colorName: string; colorHex: string; migrate: boolean }) => Promise<void>;
+}) {
+  const [name, setName] = React.useState("Preto");
+  const [hex, setHex] = React.useState("#000000");
+  const [migrate, setMigrate] = React.useState(true);
+  const [busy, setBusy] = React.useState(false);
+  const [localErr, setLocalErr] = React.useState<string | null>(null);
+
+  return (
+    <section className="mt-6 rounded-2xl border border-gray-200 bg-white shadow-sm overflow-hidden">
+      <header className="flex items-center justify-between px-3 py-2 border-b border-gray-100">
+        <div className="flex items-center gap-2">
+          <span className="grid place-items-center w-7 h-7 rounded-md bg-gray-100 border border-gray-200">
+            <Droplet className="w-4 h-4 text-gray-600" />
+          </span>
+          <h2 className="text-sm font-medium">Ativar variante de Cor</h2>
+        </div>
+      </header>
+
+      <div className="p-3 space-y-3">
+        <p className="text-xs text-gray-600">
+          Este produto foi criado sem <b>Cor</b>. Ative a variante para controlar estoque por <b>Tamanho × Cor</b>.
+          Opcionalmente, migre o estoque atual por tamanho para a cor criada.
+        </p>
+
+        <div className="flex flex-wrap items-center gap-2">
+          <input
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder="Cor (ex.: Preto)"
+            className="flex-1 min-w-40 px-3 py-2 rounded-xl border border-gray-200"
+          />
+          <div className="flex items-center gap-2">
+            <input
+              type="color"
+              value={hex}
+              onChange={(e) => setHex(e.target.value)}
+              className="h-10 w-10 rounded-lg border border-gray-200 bg-white p-1"
+              title="Escolher cor"
+            />
+            <input
+              value={hex}
+              onChange={(e) => setHex(e.target.value)}
+              placeholder="#RRGGBB"
+              className={`w-32 px-3 py-2 rounded-xl border border-gray-200`}
+            />
+          </div>
+        </div>
+
+        <label className="inline-flex items-center gap-2 text-sm text-gray-700">
+          <input type="checkbox" checked={migrate} onChange={(e) => setMigrate(e.target.checked)} />
+          Migrar estoque por Tamanho para esta cor
+        </label>
+
+        {localErr && <div className="text-xs text-red-600">{localErr}</div>}
+
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            disabled={busy}
+            onClick={async () => {
+              setLocalErr(null);
+              try {
+                if (!name.trim()) throw new Error("Informe o nome da cor.");
+                if (!isValidHex(hex)) throw new Error("Hex inválido (#RGB ou #RRGGBB).");
+                setBusy(true);
+                await onActivate({ colorName: name.trim(), colorHex: hex.trim(), migrate });
+              } catch (e) {
+                setLocalErr(e instanceof Error ? e.message : "Falha ao ativar cor");
+              } finally {
+                setBusy(false);
+              }
+            }}
+            className="inline-flex items-center gap-2 px-3 py-2 rounded-xl text-white text-sm"
+            style={{ backgroundColor: accent }}
+          >
+            {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <ArrowRight className="w-4 h-4" />}
+            Ativar Cor
+          </button>
+        </div>
+      </div>
+    </section>
   );
 }
 
@@ -658,6 +963,7 @@ function GroupEditInline({
 function OptionsList({
   groupId,
   isSizeGroup,
+  isColorGroup,
   options,
   onAdd,
   onSave,
@@ -668,9 +974,12 @@ function OptionsList({
   onStartEditSize,
   onSaveSingleSize,
   savingOne,
+  setGlobalErr,
+  hideSizeQty,
 }: {
   groupId: string;
   isSizeGroup: boolean;
+  isColorGroup: boolean;
   options: VariantOption[];
   onAdd: (groupId: string, value: string, code?: string) => void;
   onSave: (optId: string, payload: Partial<VariantOption>) => void;
@@ -682,43 +991,119 @@ function OptionsList({
   onStartEditSize: (sz: SizeKey) => void;
   onSaveSingleSize: (sz: SizeKey) => void;
   savingOne: SizeKey | null;
+
+  setGlobalErr: (v: string | null) => void;
+  hideSizeQty?: boolean;
 }) {
   const [value, setValue] = React.useState<string>("");
   const [code, setCode] = React.useState<string>("");
+  const [hexErr, setHexErr] = React.useState<string | null>(null);
 
   function toSizeKey(v: string): SizeKey | null {
     if (v === "P" || v === "M" || v === "G" || v === "GG") return v;
     return null;
   }
 
+  function handleAdd() {
+    if (!value.trim()) return;
+    if (isColorGroup) {
+      const hex = code.trim();
+      if (!isValidHex(hex)) {
+        setHexErr("Use um hex válido (#RGB ou #RRGGBB).");
+        setGlobalErr(null);
+        return;
+      }
+    }
+    setHexErr(null);
+    onAdd(groupId, value.trim(), code.trim() || undefined);
+    setValue("");
+    setCode("");
+  }
+
+  const COLOR_PRESETS: Array<{ name: string; hex: string }> = [
+    { name: "Preto", hex: "#000000" },
+    { name: "Branco", hex: "#FFFFFF" },
+    { name: "Vermelho", hex: "#FF0000" },
+    { name: "Azul", hex: "#0057FF" },
+    { name: "Verde", hex: "#01A920" },
+    { name: "Amarelo", hex: "#FFD400" },
+    { name: "Rosa", hex: "#FF5DA2" },
+    { name: "Roxo", hex: "#7F56D9" },
+    { name: "Bege", hex: "#E7D9C9" },
+    { name: "Cinza", hex: "#888888" },
+  ];
+
   return (
     <div className="p-3">
-      {/* Form inline para criar opção (mantido p/ outros grupos) */}
-      <div className="flex items-center gap-2 mb-3">
+      {/* Form inline para criar opção */}
+      <div className="flex flex-wrap items-center gap-2 mb-2">
         <input
           value={value}
           onChange={(e) => setValue(e.target.value)}
-          placeholder="Opção (ex.: Vermelho)"
-          className="flex-1 px-3 py-2 rounded-xl border border-gray-200"
+          placeholder={isColorGroup ? "Cor (ex.: Vermelho)" : "Opção (ex.: Viscose)"}
+          className="flex-1 min-w-40 px-3 py-2 rounded-xl border border-gray-200"
         />
-        <input
-          value={code}
-          onChange={(e) => setCode(e.target.value)}
-          placeholder="Código (opcional)"
-          className="w-40 px-3 py-2 rounded-xl border border-gray-200"
-        />
+
+        {isColorGroup ? (
+          <div className="flex items-center gap-2">
+            <input
+              type="color"
+              value={isValidHex(code) ? code : "#000000"}
+              onChange={(e) => setCode(e.target.value)}
+              className="h-10 w-10 rounded-lg border border-gray-200 bg-white p-1"
+              title="Escolher cor"
+            />
+            <input
+              value={code}
+              onChange={(e) => setCode(e.target.value)}
+              placeholder="#RRGGBB"
+              className={`w-32 px-3 py-2 rounded-xl border ${hexErr ? "border-red-300" : "border-gray-200"}`}
+            />
+          </div>
+        ) : (
+          <input
+            value={code}
+            onChange={(e) => setCode(e.target.value)}
+            placeholder="Código (opcional)"
+            className="w-40 px-3 py-2 rounded-xl border border-gray-200"
+          />
+        )}
+
         <button
-          onClick={() => {
-            onAdd(groupId, value, code);
-            setValue("");
-            setCode("");
-          }}
+          onClick={handleAdd}
           className="px-3 py-2 rounded-xl text-white text-sm"
           style={{ backgroundColor: ACCENT }}
         >
           <Plus className="w-4 h-4" />
         </button>
       </div>
+
+      {isColorGroup && hexErr && <div className="text-xs text-red-600 mb-2">{hexErr}</div>}
+
+      {/* Presets de cores */}
+      {isColorGroup && (
+        <div className="flex flex-wrap gap-2 mb-3">
+          {COLOR_PRESETS.map((c) => (
+            <button
+              key={c.hex}
+              type="button"
+              onClick={() => {
+                setValue(c.name);
+                setCode(c.hex);
+                setHexErr(null);
+              }}
+              className="flex items-center gap-2 px-2 py-1 rounded-lg border border-gray-200 text-xs bg-white hover:bg-gray-50"
+              title={`${c.name} ${c.hex}`}
+            >
+              <span
+                className="inline-block w-4 h-4 rounded-full border"
+                style={{ backgroundColor: c.hex, borderColor: "#e5e7eb" }}
+              />
+              {c.name}
+            </button>
+          ))}
+        </div>
+      )}
 
       {/* Lista de opções do grupo */}
       <ul className="space-y-2">
@@ -731,13 +1116,21 @@ function OptionsList({
               {/* Esquerda: editar nome/código da opção */}
               <div className="flex items-center gap-2">
                 <span className="grid place-items-center w-7 h-7 rounded-md bg-white border border-gray-200">
-                  <GripVertical className="w-4 h-4 text-gray-600" />
+                  {isColorGroup ? (
+                    <span
+                      className="inline-block w-4 h-4 rounded-full border"
+                      style={{ backgroundColor: o.code ?? "#FFFFFF", borderColor: "#e5e7eb" }}
+                      title={o.code ?? "#FFFFFF"}
+                    />
+                  ) : (
+                    <GripVertical className="w-4 h-4 text-gray-600" />
+                  )}
                 </span>
-                <OptionInline opt={o} onSave={onSave} />
+                <OptionInline opt={o} onSave={onSave} isColorGroup={isColorGroup} />
               </div>
 
-              {/* Meio: QTD inline SEMPRE visível (P/M/G/GG) com label */}
-              {isEditableSize ? (
+              {/* Meio: QTD inline SOMENTE para Tamanho — e oculto se houver grupo Cor */}
+              {isEditableSize && !hideSizeQty ? (
                 <div className="flex items-center gap-2">
                   <span className="text-xs text-gray-600">Qtd:</span>
                   {editingBySize[sz!] ? (
@@ -784,9 +1177,9 @@ function OptionsList({
                 <div />
               )}
 
-              {/* Direita: Lixeira — OCULTA no grupo Tamanho */}
+              {/* Direita: Lixeira — OCULTA no grupo Tamanho; visível nos demais (inclui Cor) */}
               {isEditableSize ? (
-                <div className="w-4 h-4" /> // placeholder para manter alinhamento
+                <div className="w-4 h-4" /> // placeholder
               ) : (
                 <button
                   onClick={() => onDelete(o.id)}
@@ -807,31 +1200,73 @@ function OptionsList({
 function OptionInline({
   opt,
   onSave,
+  isColorGroup,
 }: {
   opt: VariantOption;
   onSave: (optId: string, payload: Partial<VariantOption>) => void;
+  isColorGroup: boolean;
 }) {
   const [v, setV] = React.useState<string>(opt.value);
   const [c, setC] = React.useState<string>(opt.code || "");
   const [saving, setSaving] = React.useState<boolean>(false);
+  const [hexErr, setHexErr] = React.useState<string | null>(null);
 
   async function handleSave() {
     if (!v.trim()) return;
+    if (isColorGroup && c.trim()) {
+      if (!isValidHex(c.trim())) {
+        setHexErr("Hex inválido (#RGB ou #RRGGBB).");
+        return;
+      }
+    }
     setSaving(true);
     try {
       await onSave(opt.id, { value: v.trim(), code: c.trim() || null });
     } finally {
       setSaving(false);
+      setHexErr(null);
     }
   }
 
   return (
     <div className="flex items-center gap-2">
-      <input value={v} onChange={(e) => setV(e.target.value)} className="px-2 py-1 rounded-lg border border-gray-200 text-sm" />
-      <input value={c} onChange={(e) => setC(e.target.value)} className="w-28 px-2 py-1 rounded-lg border border-gray-200 text-sm" />
+      <input
+        value={v}
+        onChange={(e) => setV(e.target.value)}
+        className="px-2 py-1 rounded-lg border border-gray-200 text-sm"
+        placeholder={isColorGroup ? "Cor (ex.: Azul Marinho)" : "Opção"}
+      />
+
+      {isColorGroup ? (
+        <>
+          <input
+            type="color"
+            value={isValidHex(c) ? c : "#000000"}
+            onChange={(e) => setC(e.target.value)}
+            className="h-9 w-9 rounded-md border border-gray-200 bg-white p-1"
+            title="Escolher cor"
+          />
+          <input
+            value={c}
+            onChange={(e) => setC(e.target.value)}
+            className={`w-28 px-2 py-1 rounded-lg border text-sm ${hexErr ? "border-red-300" : "border-gray-200"}`}
+            placeholder="#RRGGBB"
+          />
+        </>
+      ) : (
+        <input
+          value={c}
+          onChange={(e) => setC(e.target.value)}
+          className="w-28 px-2 py-1 rounded-lg border border-gray-200 text-sm"
+          placeholder="Código"
+        />
+      )}
+
       <button onClick={handleSave} className="px-2 py-1 rounded-lg text-white text-xs" style={{ backgroundColor: ACCENT }}>
         {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Check className="w-4 h-4" />}
       </button>
+
+      {hexErr && <span className="text-xs text-red-600">{hexErr}</span>}
     </div>
   );
 }

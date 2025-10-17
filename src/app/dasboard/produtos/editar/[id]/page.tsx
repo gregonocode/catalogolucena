@@ -1,3 +1,4 @@
+// src/app/dasboard/produtos/editar/[id]/page.tsx
 "use client";
 
 import React from "react";
@@ -26,6 +27,7 @@ type Product = {
   active: boolean;
   created_at: string;
   deleted_at: string | null;
+  amount: number | null; // <<< NOVO: estoque de tamanho único
 };
 type ProductImage = {
   id: string;
@@ -48,6 +50,10 @@ type FormState = {
   newImageFile?: File | null;
   currentImageUrl?: string | null;
   currentImagePath?: string | null;
+
+  // NOVO: tamanho único
+  singleSize: boolean;
+  amountStr: string; // string numérica para o input
 };
 
 function onlyDigits(text: string) {
@@ -74,6 +80,11 @@ function formatBRLFromCents(cents: number) {
   const value = (Number.isFinite(cents) ? cents : 0) / 100;
   return value.toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
 }
+function parseAmountInt(v: string) {
+  const digits = onlyDigits(v);
+  if (!digits) return 0;
+  return Math.max(0, parseInt(digits, 10));
+}
 
 export default function EditProductPage() {
   const { id } = useParams<{ id: string }>();
@@ -96,6 +107,9 @@ export default function EditProductPage() {
     newImageFile: null,
     currentImageUrl: null,
     currentImagePath: null,
+
+    singleSize: false,
+    amountStr: "",
   });
 
   const [categories, setCategories] = React.useState<Category[]>([]);
@@ -112,7 +126,7 @@ export default function EditProductPage() {
       setErr(null);
 
       try {
-        // ==== 1) Produto (tabela principal)
+        // ==== 1) Produto (tabela principal) - precisamos do amount
         const productPromise = supabase
           .from("products")
           .select("*")
@@ -137,7 +151,7 @@ export default function EditProductPage() {
           .select("category_id")
           .eq("product_id", id);
 
-        // ==== 5) Estoque total (view que você atualizou)
+        // ==== 5) Estoque total da view (somatório de variantes)
         const stockPromise = supabase
           .from("products_with_stock")
           .select("id, total_stock")
@@ -177,6 +191,9 @@ export default function EditProductPage() {
 
         const selectedIds = (pc ?? []).map((r) => (r as { category_id: string }).category_id);
 
+        // Deriva estado de tamanho único: se amount !== null, consideramos singleSize ativo
+        const isSingle = p.amount !== null && p.amount !== undefined;
+
         if (!ignore) {
           setCategories((cats ?? []) as Category[]);
           setForm({
@@ -188,6 +205,9 @@ export default function EditProductPage() {
             newImageFile: null,
             currentImageUrl,
             currentImagePath,
+
+            singleSize: isSingle,
+            amountStr: isSingle ? String(Math.max(0, p.amount as number)) : "",
           });
           setTotalStock(Number.isFinite(stockRow?.total_stock) ? stockRow!.total_stock : 0);
         }
@@ -246,6 +266,16 @@ export default function EditProductPage() {
     }
   }
 
+  // NOVO: toggle de tamanho único
+  function toggleSingleSize() {
+    setForm((f) => ({
+      ...f,
+      singleSize: !f.singleSize,
+      // se ativar e não tiver valor, zera para "0" visível (opcional)
+      amountStr: !f.singleSize ? (f.amountStr || "0") : f.amountStr,
+    }));
+  }
+
   async function onSubmit(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
     setSaving(true);
@@ -257,7 +287,10 @@ export default function EditProductPage() {
 
       const price_cents = parseBRLToCents(form.priceBRL);
 
-      // 1) Atualiza produto (sem amount)
+      // amount: se singleSize, salvar inteiro; senão, null
+      const amountToSave = form.singleSize ? parseAmountInt(form.amountStr) : null;
+
+      // 1) Atualiza produto (inclui amount)
       const { error: upErr } = await supabase
         .from("products")
         .update({
@@ -265,6 +298,7 @@ export default function EditProductPage() {
           description: form.description.trim() || null,
           price_cents,
           active: form.active,
+          amount: amountToSave, // <<< NOVO
         })
         .eq("id", id);
       if (upErr) throw upErr;
@@ -362,21 +396,29 @@ export default function EditProductPage() {
         </div>
       )}
 
-      {/* Info rápida do estoque total + atalho para variantes */}
-      <div className="mb-4 flex items-center justify-between rounded-xl border border-gray-100 bg-gray-50 px-3 py-2 text-sm">
-        <div>
-          <span className="text-gray-600">Estoque total (tamanhos + combinações): </span>
-          <span className="font-semibold tabular-nums">{totalStock}</span>
+      {/* Bloco de estoque/variantes: se for tamanho único, escondemos a parte de variantes */}
+      {!form.singleSize && (
+        <div className="mb-4 flex items-center justify-between rounded-xl border border-gray-100 bg-gray-50 px-3 py-2 text-sm">
+          <div>
+            <span className="text-gray-600">Estoque total (tamanhos + combinações): </span>
+            <span className="font-semibold tabular-nums">{totalStock}</span>
+          </div>
+          <Link
+            href="/dasboard/variantes"
+            className="inline-flex items-center gap-1 px-2 py-1 rounded-lg border border-gray-200 bg-white text-xs"
+            title="Gerenciar variantes e estoque por combinação"
+          >
+            <Layers3 className="w-4 h-4" />
+            Gerenciar variantes
+          </Link>
         </div>
-        <Link
-          href="/dasboard/variantes"
-          className="inline-flex items-center gap-1 px-2 py-1 rounded-lg border border-gray-200 bg-white text-xs"
-          title="Gerenciar variantes e estoque por combinação"
-        >
-          <Layers3 className="w-4 h-4" />
-          Gerenciar variantes
-        </Link>
-      </div>
+      )}
+
+      {form.singleSize && (
+        <div className="mb-4 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm">
+          <b>Tamanho único:</b> este produto usa <code>products.amount</code> como estoque global.
+        </div>
+      )}
 
       <form onSubmit={onSubmit} className="space-y-4">
         {/* Nome */}
@@ -413,6 +455,44 @@ export default function EditProductPage() {
             className="w-full px-3 py-2 rounded-xl border border-gray-200 focus:outline-none focus:ring-4"
           />
         </div>
+
+        {/* ===== NOVO BLOCO: Tamanho único + estoque ===== */}
+        <div className="rounded-2xl border border-gray-100 bg-white shadow-sm p-3 space-y-3">
+          <div className="flex items-center justify-between">
+            <label className="text-sm text-gray-700">Este produto é tamanho único?</label>
+            <button
+              type="button"
+              onClick={toggleSingleSize}
+              className={`w-12 h-6 rounded-full relative transition-colors ${form.singleSize ? "bg-emerald-500" : "bg-gray-300"}`}
+            >
+              <span
+                className={`absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white transition-transform ${
+                  form.singleSize ? "translate-x-6" : "translate-x-0"
+                }`}
+              />
+            </button>
+          </div>
+
+          {form.singleSize && (
+            <div className="space-y-1">
+              <label className="text-sm text-gray-700">Quantidade em estoque</label>
+              <input
+                inputMode="numeric"
+                value={form.amountStr}
+                onChange={(e) => {
+                  const digits = onlyDigits(e.target.value);
+                  setForm((f) => ({ ...f, amountStr: digits }));
+                }}
+                placeholder="0"
+                className="w-full px-3 py-2 rounded-xl border border-gray-200 focus:outline-none focus:ring-4"
+              />
+              <p className="text-xs text-gray-500">
+                Salvo no campo <b>products.amount</b>. Ao desativar, o estoque volta a ser controlado por variantes.
+              </p>
+            </div>
+          )}
+        </div>
+        {/* ===== FIM TAMANHO ÚNICO ===== */}
 
         {/* Categorias */}
         <div className="space-y-1">

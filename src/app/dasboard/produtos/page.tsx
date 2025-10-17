@@ -21,7 +21,11 @@ type FormState = {
   categoryIds: string[];
   imageFile?: File | null;
 
-  // Novos campos (variantes):
+  // NOVO: tamanho único + estoque no products.amount
+  singleSize: boolean;       // toggle "Este produto é tamanho único?"
+  amountStr: string;         // input de estoque (string numérica)
+
+  // Variantes:
   createSizeGroup: boolean;
   sizesToCreate: Record<SizeKey, boolean>;
 
@@ -47,6 +51,10 @@ export default function ProductsPage() {
     active: true,
     categoryIds: [],
     imageFile: null,
+
+    // NOVO:
+    singleSize: false,
+    amountStr: "",
 
     createSizeGroup: false,
     sizesToCreate: { P: false, M: false, G: false, GG: false },
@@ -82,7 +90,7 @@ export default function ProductsPage() {
     };
   }, [supabase]);
 
-  // Helpers de preço sem regex
+  // Helpers
   function onlyDigits(text: string) {
     return Array.from(text)
       .filter((ch) => ch >= "0" && ch <= "9")
@@ -105,11 +113,27 @@ export default function ProductsPage() {
     const num = Number(cleaned || "0");
     return Math.round(num * 100);
   }
+  function parseAmountInt(v: string) {
+    const digits = onlyDigits(v);
+    if (!digits) return 0;
+    return Math.max(0, parseInt(digits, 10));
+  }
 
   function validate(): string | null {
     if (!form.title.trim()) return "Informe o nome do produto";
     if (!form.priceBRL.trim()) return "Informe o preço";
 
+    // Se for tamanho único, exigir quantidade (>= 0; aqui exigimos que o usuário preencha explicitamente)
+    if (form.singleSize) {
+      const amt = form.amountStr.trim();
+      if (amt === "") return "Informe a quantidade em estoque para tamanho único";
+      const asInt = parseAmountInt(amt);
+      if (isNaN(asInt) || asInt < 0) return "Quantidade inválida";
+      // Sem variantes nesse modo
+      return null;
+    }
+
+    // Caso não seja tamanho único, validar variantes escolhidas (se ativadas)
     if (form.createColorGroup) {
       for (const c of form.colorDrafts) {
         if (!c.name.trim()) return "Informe o nome de cada cor adicionada";
@@ -134,8 +158,9 @@ export default function ProductsPage() {
       if (v) throw new Error(v);
 
       const price_cents = parseBRLToCents(form.priceBRL);
+      const amountToSave = form.singleSize ? parseAmountInt(form.amountStr) : null;
 
-      // 1) Inserir produto
+      // 1) Inserir produto (incluindo amount quando tamanho único)
       const { data: product, error: prodErr } = await supabase
         .from("products")
         .insert({
@@ -143,6 +168,7 @@ export default function ProductsPage() {
           description: form.description.trim() || null,
           price_cents,
           active: form.active,
+          amount: amountToSave, // <<<<<< NOVO
         })
         .select("id")
         .single<{ id: string }>();
@@ -180,51 +206,52 @@ export default function ProductsPage() {
         if (pcErr) throw pcErr;
       }
 
-      // 4) (Opcional) Criar grupo Tamanho + opções (P/M/G/GG selecionadas)
-      if (form.createSizeGroup) {
-        // cria grupo "Tamanho" na última posição
-        const { data: sizeGroup, error: sizeGroupErr } = await supabase
-          .from("variant_groups")
-          .insert({ product_id: productId, name: "Tamanho", position: 0 })
-          .select("id")
-          .single<{ id: string }>();
-        if (sizeGroupErr) throw sizeGroupErr;
+      // 4) Variantes — SOMENTE se NÃO for tamanho único
+      if (!form.singleSize) {
+        // 4.1) Grupo Tamanho
+        if (form.createSizeGroup) {
+          const { data: sizeGroup, error: sizeGroupErr } = await supabase
+            .from("variant_groups")
+            .insert({ product_id: productId, name: "Tamanho", position: 0 })
+            .select("id")
+            .single<{ id: string }>();
+          if (sizeGroupErr) throw sizeGroupErr;
 
-        const sizeOptions = SIZE_LABELS
-          .filter((s) => form.sizesToCreate[s])
-          .map((s, idx) => ({
-            variant_group_id: sizeGroup.id,
-            value: s,
-            code: s, // mantém como você já usa
+          const sizeOptions = SIZE_LABELS
+            .filter((s) => form.sizesToCreate[s])
+            .map((s, idx) => ({
+              variant_group_id: sizeGroup.id,
+              value: s,
+              code: s,
+              position: idx,
+            }));
+
+          if (sizeOptions.length) {
+            const { error: sizeOptsErr } = await supabase.from("variant_options").insert(sizeOptions);
+            if (sizeOptsErr) throw sizeOptsErr;
+          }
+        }
+
+        // 4.2) Grupo Cor
+        if (form.createColorGroup) {
+          const { data: colorGroup, error: colorGroupErr } = await supabase
+            .from("variant_groups")
+            .insert({ product_id: productId, name: "Cor", position: 1 })
+            .select("id")
+            .single<{ id: string }>();
+          if (colorGroupErr) throw colorGroupErr;
+
+          const colorOptions = form.colorDrafts.map((c, idx) => ({
+            variant_group_id: colorGroup.id,
+            value: c.name.trim(),
+            code: c.hex.trim(),
             position: idx,
           }));
 
-        if (sizeOptions.length) {
-          const { error: sizeOptsErr } = await supabase.from("variant_options").insert(sizeOptions);
-          if (sizeOptsErr) throw sizeOptsErr;
-          // (Opcional) não criamos product_variants aqui; a tela de Variantes mostra amount=0
-        }
-      }
-
-      // 5) (Opcional) Criar grupo Cor + opções (nome + hex)
-      if (form.createColorGroup) {
-        const { data: colorGroup, error: colorGroupErr } = await supabase
-          .from("variant_groups")
-          .insert({ product_id: productId, name: "Cor", position: 1 })
-          .select("id")
-          .single<{ id: string }>();
-        if (colorGroupErr) throw colorGroupErr;
-
-        const colorOptions = form.colorDrafts.map((c, idx) => ({
-          variant_group_id: colorGroup.id,
-          value: c.name.trim(),
-          code: c.hex.trim(), // hex vai no code (como fizemos na tela de Variantes)
-          position: idx,
-        }));
-
-        if (colorOptions.length) {
-          const { error: colorOptsErr } = await supabase.from("variant_options").insert(colorOptions);
-          if (colorOptsErr) throw colorOptsErr;
+          if (colorOptions.length) {
+            const { error: colorOptsErr } = await supabase.from("variant_options").insert(colorOptions);
+            if (colorOptsErr) throw colorOptsErr;
+          }
         }
       }
 
@@ -236,8 +263,13 @@ export default function ProductsPage() {
         active: true,
         categoryIds: [],
         imageFile: null,
+
+        singleSize: false,
+        amountStr: "",
+
         createSizeGroup: false,
         sizesToCreate: { P: false, M: false, G: false, GG: false },
+
         createColorGroup: false,
         colorDrafts: [],
         colorNameInput: "",
@@ -264,14 +296,13 @@ export default function ProductsPage() {
     }));
   }
 
-  // handlers variantes
+  // Handlers variantes
   function toggleCreateSizeGroup() {
     setForm((f) => ({ ...f, createSizeGroup: !f.createSizeGroup }));
   }
   function toggleSize(s: SizeKey) {
     setForm((f) => ({ ...f, sizesToCreate: { ...f.sizesToCreate, [s]: !f.sizesToCreate[s] } }));
   }
-
   function toggleCreateColorGroup() {
     setForm((f) => ({ ...f, createColorGroup: !f.createColorGroup }));
   }
@@ -296,6 +327,20 @@ export default function ProductsPage() {
     setForm((f) => ({
       ...f,
       colorDrafts: f.colorDrafts.filter((_, i) => i !== idx),
+    }));
+  }
+
+  // NOVO: toggle tamanho único — ao ativar, ocultamos variantes e limpamos seleções
+  function toggleSingleSize() {
+    setForm((f) => ({
+      ...f,
+      singleSize: !f.singleSize,
+      // se ativar, desliga variantes e limpa seleções
+      createSizeGroup: !f.singleSize ? false : f.createSizeGroup,
+      createColorGroup: !f.singleSize ? false : f.createColorGroup,
+      sizesToCreate: !f.singleSize ? { P: false, M: false, G: false, GG: false } : f.sizesToCreate,
+      // se desativar, mantém amount preenchido para não perder dado; pode limpar se preferir:
+      // amountStr: !f.singleSize ? "" : f.amountStr,
     }));
   }
 
@@ -343,7 +388,44 @@ export default function ProductsPage() {
           />
         </div>
 
-        {/* (removido) Estoque/amount */}
+        {/* ===== NOVO BLOCO: Tamanho único + estoque ===== */}
+        <div className="rounded-2xl border border-gray-100 bg-white shadow-sm p-3 space-y-3">
+          <div className="flex items-center justify-between">
+            <label className="text-sm text-gray-700">Este produto é tamanho único?</label>
+            <button
+              type="button"
+              onClick={toggleSingleSize}
+              className={`w-12 h-6 rounded-full relative transition-colors ${form.singleSize ? "bg-emerald-500" : "bg-gray-300"}`}
+            >
+              <span
+                className={`absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white transition-transform ${
+                  form.singleSize ? "translate-x-6" : "translate-x-0"
+                }`}
+              />
+            </button>
+          </div>
+
+          {form.singleSize && (
+            <div className="space-y-1">
+              <label className="text-sm text-gray-700">Quantidade em estoque</label>
+              <input
+                inputMode="numeric"
+                value={form.amountStr}
+                onChange={(e) => {
+                  // apenas dígitos
+                  const digits = onlyDigits(e.target.value);
+                  setForm((f) => ({ ...f, amountStr: digits }));
+                }}
+                placeholder="0"
+                className="w-full px-3 py-2 rounded-xl border border-gray-200 focus:outline-none focus:ring-4"
+              />
+              <p className="text-xs text-gray-500">
+                Produto de tamanho unico. Variantes ficam desativadas nesse modo.
+              </p>
+            </div>
+          )}
+        </div>
+        {/* ===== FIM TAMANHO ÚNICO ===== */}
 
         <div className="space-y-1">
           <label className="text-sm text-gray-700">Categorias</label>
@@ -395,142 +477,143 @@ export default function ProductsPage() {
           </label>
         </div>
 
-        {/* ====== NOVO BLOCO: Variantes (opcional) ====== */}
-        <div className="space-y-4 rounded-2xl border border-gray-100 bg-white shadow-sm p-3">
-          <div className="text-sm font-medium mb-1">Variantes (opcional)</div>
+        {/* ===== Variantes (opcional) — oculto quando tamanho único ===== */}
+        {!form.singleSize && (
+          <div className="space-y-4 rounded-2xl border border-gray-100 bg-white shadow-sm p-3">
+            <div className="text-sm font-medium mb-1">Variantes (opcional)</div>
 
-          {/* Tamanho */}
-          <div className="rounded-xl border border-gray-100 p-3">
-            <div className="flex items-center justify-between">
-              <label className="text-sm text-gray-700">Criar grupo "Tamanho"</label>
-              <button
-                type="button"
-                onClick={toggleCreateSizeGroup}
-                className={`w-12 h-6 rounded-full relative transition-colors ${
-                  form.createSizeGroup ? "bg-emerald-500" : "bg-gray-300"
-                }`}
-              >
-                <span
-                  className={`absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white transition-transform ${
-                    form.createSizeGroup ? "translate-x-6" : "translate-x-0"
+            {/* Tamanho */}
+            <div className="rounded-xl border border-gray-100 p-3">
+              <div className="flex items-center justify-between">
+                <label className="text-sm text-gray-700">Criar grupo "Tamanho"</label>
+                <button
+                  type="button"
+                  onClick={toggleCreateSizeGroup}
+                  className={`w-12 h-6 rounded-full relative transition-colors ${
+                    form.createSizeGroup ? "bg-emerald-500" : "bg-gray-300"
                   }`}
-                />
-              </button>
-            </div>
-
-            {form.createSizeGroup && (
-              <div className="mt-3">
-                <div className="text-xs text-gray-500 mb-2">Selecione os tamanhos a criar:</div>
-                <div className="flex flex-wrap gap-2">
-                  {SIZE_LABELS.map((sz) => {
-                    const active = form.sizesToCreate[sz];
-                    return (
-                      <button
-                        key={sz}
-                        type="button"
-                        onClick={() => toggleSize(sz)}
-                        className={`px-3 py-1.5 rounded-full border text-sm ${
-                          active ? "text-white border-transparent" : "text-gray-700 border-gray-200 bg-gray-50"
-                        }`}
-                        style={active ? { backgroundColor: ACCENT } : {}}
-                      >
-                        {sz}
-                      </button>
-                    );
-                  })}
-                </div>
+                >
+                  <span
+                    className={`absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white transition-transform ${
+                      form.createSizeGroup ? "translate-x-6" : "translate-x-0"
+                    }`}
+                  />
+                </button>
               </div>
-            )}
-          </div>
 
-          {/* Cor */}
-          <div className="rounded-xl border border-gray-100 p-3">
-            <div className="flex items-center justify-between">
-              <label className="text-sm text-gray-700">Criar grupo "Cor"</label>
-              <button
-                type="button"
-                onClick={toggleCreateColorGroup}
-                className={`w-12 h-6 rounded-full relative transition-colors ${
-                  form.createColorGroup ? "bg-emerald-500" : "bg-gray-300"
-                }`}
-              >
-                <span
-                  className={`absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white transition-transform ${
-                    form.createColorGroup ? "translate-x-6" : "translate-x-0"
-                  }`}
-                />
-              </button>
-            </div>
-
-            {form.createColorGroup && (
-              <div className="mt-3 space-y-3">
-                {/* Linha de adição */}
-                <div className="flex flex-wrap items-center gap-2">
-                  <input
-                    value={form.colorNameInput}
-                    onChange={(e) => setForm((f) => ({ ...f, colorNameInput: e.target.value }))}
-                    placeholder="Nome da cor (ex.: Preto)"
-                    className="flex-1 min-w-40 px-3 py-2 rounded-xl border border-gray-200"
-                  />
-                  <input
-                    type="color"
-                    value={isValidHex(form.colorHexInput) ? form.colorHexInput : "#000000"}
-                    onChange={(e) => setForm((f) => ({ ...f, colorHexInput: e.target.value }))}
-                    className="h-10 w-10 rounded-lg border border-gray-200 bg-white p-1"
-                    title="Escolher cor"
-                  />
-                  <input
-                    value={form.colorHexInput}
-                    onChange={(e) => setForm((f) => ({ ...f, colorHexInput: e.target.value }))}
-                    placeholder="#RRGGBB"
-                    className="w-32 px-3 py-2 rounded-xl border border-gray-200"
-                  />
-                  <button
-                    type="button"
-                    onClick={addColorDraft}
-                    className="px-3 py-2 rounded-xl text-white text-sm"
-                    style={{ backgroundColor: ACCENT }}
-                  >
-                    <Plus className="w-4 h-4" />
-                  </button>
-                </div>
-
-                {/* Lista de cores adicionadas (draft) */}
-                {form.colorDrafts.length ? (
-                  <ul className="space-y-2">
-                    {form.colorDrafts.map((c, idx) => (
-                      <li
-                        key={`${c.name}-${idx}`}
-                        className="flex items-center justify-between p-2 rounded-xl border border-gray-100 bg-gray-50"
-                      >
-                        <div className="flex items-center gap-2">
-                          <span
-                            className="inline-block w-5 h-5 rounded-full border"
-                            style={{ backgroundColor: c.hex, borderColor: "#e5e7eb" }}
-                            title={c.hex}
-                          />
-                          <span className="text-sm">{c.name}</span>
-                          <span className="text-xs text-gray-500">{c.hex}</span>
-                        </div>
+              {form.createSizeGroup && (
+                <div className="mt-3">
+                  <div className="text-xs text-gray-500 mb-2">Selecione os tamanhos a criar:</div>
+                  <div className="flex flex-wrap gap-2">
+                    {SIZE_LABELS.map((sz) => {
+                      const active = form.sizesToCreate[sz];
+                      return (
                         <button
+                          key={sz}
                           type="button"
-                          onClick={() => removeColorDraft(idx)}
-                          className="px-2 py-1 rounded-lg border border-gray-200 text-xs bg-white"
-                          title="Remover"
+                          onClick={() => toggleSize(sz)}
+                          className={`px-3 py-1.5 rounded-full border text-sm ${
+                            active ? "text-white border-transparent" : "text-gray-700 border-gray-200 bg-gray-50"
+                          }`}
+                          style={active ? { backgroundColor: ACCENT } : {}}
                         >
-                          <Trash2 className="w-4 h-4" />
+                          {sz}
                         </button>
-                      </li>
-                    ))}
-                  </ul>
-                ) : (
-                  <div className="text-xs text-gray-500">Nenhuma cor adicionada.</div>
-                )}
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Cor */}
+            <div className="rounded-xl border border-gray-100 p-3">
+              <div className="flex items-center justify-between">
+                <label className="text-sm text-gray-700">Criar grupo "Cor"</label>
+                <button
+                  type="button"
+                  onClick={toggleCreateColorGroup}
+                  className={`w-12 h-6 rounded-full relative transition-colors ${
+                    form.createColorGroup ? "bg-emerald-500" : "bg-gray-300"
+                  }`}
+                >
+                  <span
+                    className={`absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white transition-transform ${
+                      form.createColorGroup ? "translate-x-6" : "translate-x-0"
+                    }`}
+                  />
+                </button>
               </div>
-            )}
+
+              {form.createColorGroup && (
+                <div className="mt-3 space-y-3">
+                  {/* Linha de adição */}
+                  <div className="flex flex-wrap items-center gap-2">
+                    <input
+                      value={form.colorNameInput}
+                      onChange={(e) => setForm((f) => ({ ...f, colorNameInput: e.target.value }))}
+                      placeholder="Nome da cor (ex.: Preto)"
+                      className="flex-1 min-w-40 px-3 py-2 rounded-xl border border-gray-200"
+                    />
+                    <input
+                      type="color"
+                      value={isValidHex(form.colorHexInput) ? form.colorHexInput : "#000000"}
+                      onChange={(e) => setForm((f) => ({ ...f, colorHexInput: e.target.value }))}
+                      className="h-10 w-10 rounded-lg border border-gray-200 bg-white p-1"
+                      title="Escolher cor"
+                    />
+                    <input
+                      value={form.colorHexInput}
+                      onChange={(e) => setForm((f) => ({ ...f, colorHexInput: e.target.value }))}
+                      placeholder="#RRGGBB"
+                      className="w-32 px-3 py-2 rounded-xl border border-gray-200"
+                    />
+                    <button
+                      type="button"
+                      onClick={addColorDraft}
+                      className="px-3 py-2 rounded-xl text-white text-sm"
+                      style={{ backgroundColor: ACCENT }}
+                    >
+                      <Plus className="w-4 h-4" />
+                    </button>
+                  </div>
+
+                  {/* Lista de cores adicionadas */}
+                  {form.colorDrafts.length ? (
+                    <ul className="space-y-2">
+                      {form.colorDrafts.map((c, idx) => (
+                        <li
+                          key={`${c.name}-${idx}`}
+                          className="flex items-center justify-between p-2 rounded-xl border border-gray-100 bg-gray-50"
+                        >
+                          <div className="flex items-center gap-2">
+                            <span
+                              className="inline-block w-5 h-5 rounded-full border"
+                              style={{ backgroundColor: c.hex, borderColor: "#e5e7eb" }}
+                              title={c.hex}
+                            />
+                            <span className="text-sm">{c.name}</span>
+                            <span className="text-xs text-gray-500">{c.hex}</span>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => removeColorDraft(idx)}
+                            className="px-2 py-1 rounded-lg border border-gray-200 text-xs bg-white"
+                            title="Remover"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <div className="text-xs text-gray-500">Nenhuma cor adicionada.</div>
+                  )}
+                </div>
+              )}
+            </div>
           </div>
-        </div>
-        {/* ====== FIM VARIANTES ====== */}
+        )}
 
         <div className="flex items-center justify-between">
           <label className="text-sm text-gray-700">Ativo</label>
@@ -578,7 +661,7 @@ export default function ProductsPage() {
           <li>Na lista de produtos, exibir Imagem / Produto / Preço / Categorias / Status.</li>
           <li>Implementar edição do produto (update) e upload secundário de imagens.</li>
           <li>(Opcional) Validar tamanho/tipo da imagem antes do upload.</li>
-          <li>Gestão de estoque agora é por <b>variantes</b> no módulo “Variantes”.</li>
+          <li>Gestão de estoque pode ser por <b>tamanho único (products.amount)</b> ou por <b>variantes</b>.</li>
         </ol>
       </div>
     </div>

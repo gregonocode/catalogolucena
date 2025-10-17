@@ -1454,7 +1454,7 @@ export default function Page() {
     <div className="text-sm font-medium mb-1">Cor</div>
 
     {(() => {
-      // se houver 3 ou menos cores, NÃO mostrar os nomes (só as bolinhas)
+      // se houver 3 ou mais cores, NÃO mostrar os nomes (só as bolinhas)
       const showColorNames = quickAdd.colors.length <= 3;
 
       return (

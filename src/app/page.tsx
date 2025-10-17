@@ -10,7 +10,8 @@ import { supabaseBrowser } from "@/lib/supabase-browser";
 const ACCENT = "#01A920";
 
 /* ===================== Tipos ===================== */
-type Category = { id: string; name: string; slug: string };
+type Category = { id: string; name: string; slug: string; ordem?: number };
+
 
 type ProductRow = {
   id: string;
@@ -166,9 +167,11 @@ export default function Page() {
       setErr(null);
 
       const catsPromise = supabase
-        .from("categories")
-        .select("id, name, slug")
-        .order("created_at", { ascending: false });
+  .from("categories")
+  .select("id, name, slug, ordem")           // + ordem
+  .order("ordem", { ascending: true })       // ordena pela ordem definida no dashboard
+  .order("created_at", { ascending: false }); // tie-break opcional
+
 
       const prodsPromise = supabase
         .from("products")

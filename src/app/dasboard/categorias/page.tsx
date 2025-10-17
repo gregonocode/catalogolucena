@@ -1,7 +1,7 @@
 "use client";
 
 import React from "react";
-import { Plus, Loader2, Check, X, Edit3, Trash2, Tag } from "lucide-react";
+import { Plus, Loader2, Check, X, Edit3, Trash2, Tag, GripVertical } from "lucide-react";
 import { supabaseBrowser } from "@/lib/supabase-browser";
 import type { PostgrestError } from "@supabase/supabase-js";
 
@@ -11,6 +11,7 @@ type Category = {
   id: string;
   name: string;
   slug: string;
+  ordem: number; // novo campo
 };
 
 type EditableCategory = Category & { _editing?: boolean };
@@ -43,6 +44,24 @@ export default function CategoriesPage() {
   const [ok, setOk] = React.useState<string | null>(null);
   const [err, setErr] = React.useState<string | null>(null);
 
+  // Drag state
+  const [dragId, setDragId] = React.useState<string | null>(null);
+  const [dragOverId, setDragOverId] = React.useState<string | null>(null);
+  const [savingOrder, setSavingOrder] = React.useState(false);
+
+  async function refetch() {
+    const { data, error } = await supabase
+      .from("categories")
+      .select("id, name, slug, ordem")
+      .order("ordem", { ascending: true })
+      .order("created_at", { ascending: false });
+    if (error) {
+      setErr(error.message);
+      return;
+    }
+    setItems(((data ?? []) as Category[]).sort((a, b) => a.ordem - b.ordem));
+  }
+
   // Carrega categorias do banco
   React.useEffect(() => {
     let ignore = false;
@@ -50,7 +69,8 @@ export default function CategoriesPage() {
       setLoading(true);
       const { data, error } = await supabase
         .from("categories")
-        .select("id, name, slug")
+        .select("id, name, slug, ordem")
+        .order("ordem", { ascending: true })
         .order("created_at", { ascending: false });
 
       if (!ignore) {
@@ -58,7 +78,7 @@ export default function CategoriesPage() {
           console.error(error);
           setErr(error.message);
         } else {
-          setItems((data ?? []) as Category[]);
+          setItems(((data ?? []) as Category[]).sort((a, b) => a.ordem - b.ordem));
         }
         setLoading(false);
       }
@@ -90,11 +110,21 @@ export default function CategoriesPage() {
       const finalSlug = (slug || slugify(name)).trim();
       if (!finalSlug) throw new Error("Slug inválido");
 
+      // pega maior ordem atual
+      const { data: maxRow, error: maxErr } = await supabase
+        .from("categories")
+        .select("ordem")
+        .order("ordem", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (maxErr) throw maxErr;
+      const nextOrder = (maxRow?.ordem ?? 0) + 1;
+
       // Inserir no Supabase
       const { data, error } = await supabase
         .from("categories")
-        .insert({ name: name.trim(), slug: finalSlug })
-        .select("id, name, slug")
+        .insert({ name: name.trim(), slug: finalSlug, ordem: nextOrder })
+        .select("id, name, slug, ordem")
         .single();
 
       if (error) {
@@ -104,7 +134,7 @@ export default function CategoriesPage() {
         throw error;
       }
 
-      setItems((arr) => [data as Category, ...arr]);
+      setItems((arr) => [...arr, data as Category].sort((a, b) => a.ordem - b.ordem));
       setOk("Categoria criada com sucesso!");
       resetForm();
     } catch (e: unknown) {
@@ -129,7 +159,7 @@ export default function CategoriesPage() {
         .from("categories")
         .update({ name: newName.trim(), slug: newSlug.trim() })
         .eq("id", id)
-        .select("id, name, slug")
+        .select("id, name, slug, ordem")
         .single();
 
       if (error) {
@@ -138,7 +168,9 @@ export default function CategoriesPage() {
       }
 
       setItems((arr) =>
-        arr.map((c) => (c.id === id ? { ...(data as Category), _editing: false } : c)),
+        arr
+          .map((c) => (c.id === id ? { ...(data as Category), _editing: false } : c))
+          .sort((a, b) => a.ordem - b.ordem),
       );
     } catch (e: unknown) {
       setErr((e as Error)?.message || "Erro ao salvar");
@@ -154,6 +186,68 @@ export default function CategoriesPage() {
     } catch (e: unknown) {
       setErr((e as Error)?.message || "Erro ao remover");
     }
+  }
+
+  // ---------- Drag & Drop ----------
+  function reorderLocalByIds(arr: EditableCategory[], fromId: string, toId: string) {
+    const next = [...arr];
+    const fromIndex = next.findIndex((c) => c.id === fromId);
+    const toIndex = next.findIndex((c) => c.id === toId);
+    if (fromIndex < 0 || toIndex < 0 || fromIndex === toIndex) return next;
+
+    const [moved] = next.splice(fromIndex, 1);
+    next.splice(toIndex, 0, moved);
+
+    // reindexa ordens localmente (1..N)
+    return next.map((c, i) => ({ ...c, ordem: i + 1 }));
+  }
+
+  async function persistOrder(arr: EditableCategory[]) {
+  setSavingOrder(true);
+  setOk(null);
+  setErr(null);
+
+  try {
+    const orderedIds = arr.map((c) => c.id);
+    const { error } = await supabase.rpc("reorder_categories", { p_ids: orderedIds });
+    if (error) throw error;
+
+    // refetch para sincronizar e garantir que a ordem do banco refletiu na UI
+    await refetch();
+    setOk("Ordem salva!");
+  } catch (e) {
+    setErr((e as Error)?.message || "Falha ao salvar nova ordem");
+  } finally {
+    setSavingOrder(false);
+  }
+}
+
+  function handleDragStart(id: string) {
+    setDragId(id);
+  }
+
+  function handleDragOver(e: React.DragEvent<HTMLLIElement>, overId: string) {
+    e.preventDefault();
+    if (dragOverId !== overId) setDragOverId(overId);
+  }
+
+  async function handleDrop(e: React.DragEvent<HTMLLIElement>, dropTargetId: string) {
+    e.preventDefault();
+    if (!dragId || dragId === dropTargetId) {
+      setDragId(null);
+      setDragOverId(null);
+      return;
+    }
+    const next = reorderLocalByIds(items, dragId, dropTargetId);
+    setItems(next);
+    setDragId(null);
+    setDragOverId(null);
+    await persistOrder(next);
+  }
+
+  function handleDragEnd() {
+    setDragId(null);
+    setDragOverId(null);
   }
 
   return (
@@ -216,34 +310,55 @@ export default function CategoriesPage() {
               <Check className="w-4 h-4" /> {ok}
             </span>
           )}
-          {err && (
-            <span className="inline-flex items-center gap-1 text-sm text-red-700 bg-red-50 border border-red-200 px-2 py-1 rounded-xl">
-              <X className="w-4 h-4" /> {err}
+          {(err || savingOrder) && (
+            <span className="inline-flex items-center gap-1 text-sm text-amber-700 bg-amber-50 border border-amber-200 px-2 py-1 rounded-xl">
+              {savingOrder ? <Loader2 className="w-4 h-4 animate-spin" /> : <X className="w-4 h-4" />}
+              {savingOrder ? "Salvando ordem..." : err}
             </span>
           )}
         </div>
       </form>
 
-      {/* Lista de categorias */}
+      {/* Lista de categorias (arrastável) */}
       {loading ? (
         <div className="p-3 rounded-xl border border-gray-100 bg-gray-50 text-sm text-gray-600">
           Carregando...
         </div>
       ) : (
         <ul className="space-y-2">
-          {items.map((c) => (
-            <li key={c.id} className="p-3 rounded-xl border border-gray-100 bg-white shadow-sm">
-              {c._editing ? (
-                <EditRow
-                  category={c}
-                  onCancel={cancelEdit}
-                  onSave={(payload) => saveEdit(c.id, payload.name, payload.slug)}
-                />
-              ) : (
-                <ViewRow category={c} onEdit={() => startEdit(c.id)} onDelete={() => remove(c.id)} />
-              )}
-            </li>
-          ))}
+          {items.map((c) => {
+            const isDragging = dragId === c.id;
+            const isOver = dragOverId === c.id && dragId !== c.id;
+
+            return (
+              <li
+                key={c.id}
+                className={`p-3 rounded-xl border bg-white shadow-sm transition
+                  ${isOver ? "border-blue-300 ring-2 ring-blue-100" : "border-gray-100"}
+                  ${isDragging ? "opacity-60" : ""}
+                `}
+                draggable={!c._editing}
+                onDragStart={() => handleDragStart(c.id)}
+                onDragOver={(e) => handleDragOver(e, c.id)}
+                onDrop={(e) => handleDrop(e, c.id)}
+                onDragEnd={handleDragEnd}
+              >
+                {c._editing ? (
+                  <EditRow
+                    category={c}
+                    onCancel={cancelEdit}
+                    onSave={(payload) => saveEdit(c.id, payload.name, payload.slug)}
+                  />
+                ) : (
+                  <ViewRow
+                    category={c}
+                    onEdit={() => startEdit(c.id)}
+                    onDelete={() => remove(c.id)}
+                  />
+                )}
+              </li>
+            );
+          })}
           {items.length === 0 && (
             <li className="p-3 rounded-xl border border-gray-100 bg-white text-sm text-gray-600">
               Nenhuma categoria cadastrada.
@@ -266,20 +381,31 @@ function ViewRow({
 }) {
   return (
     <div className="flex items-center justify-between">
-      <div>
-        <div className="text-sm font-medium">{category.name}</div>
-        <div className="text-xs text-gray-500">/{category.slug}</div>
+      <div className="flex items-center gap-3">
+        <span className="inline-flex items-center justify-center w-7 h-7 rounded-lg border border-gray-200 bg-gray-50 text-xs text-gray-600 select-none">
+          {category.ordem}
+        </span>
+        <div>
+          <div className="text-sm font-medium">{category.name}</div>
+          <div className="text-xs text-gray-500">/{category.slug}</div>
+        </div>
       </div>
       <div className="flex items-center gap-1.5">
+        <span className="px-2 py-1 rounded-lg border border-gray-200 text-xs bg-white text-gray-500 cursor-grab select-none inline-flex items-center gap-1">
+          <GripVertical className="w-4 h-4" />
+          arraste
+        </span>
         <button
           onClick={onEdit}
           className="px-2 py-1 rounded-lg border border-gray-200 text-xs text-gray-700 bg-white"
+          title="Editar"
         >
           <Edit3 className="w-4 h-4" />
         </button>
         <button
           onClick={onDelete}
           className="px-2 py-1 rounded-lg border border-gray-200 text-xs text-gray-700 bg-white"
+          title="Excluir"
         >
           <Trash2 className="w-4 h-4" />
         </button>

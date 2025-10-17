@@ -103,7 +103,6 @@ export default function ProductDetailsPage() {
   const [sizes, setSizes] = React.useState<SizeEntry[]>([]);
   const [colors, setColors] = React.useState<ColorEntry[]>([]);
   const [stockByCombo, setStockByCombo] = React.useState<StockMap>({});
-  const [sizeIdByKey, setSizeIdByKey] = React.useState<Record<SizeKey, string> | null>(null);
 
   // Conhecimento do estoque
   const [variantsKnown, setVariantsKnown] = React.useState(false);
@@ -281,7 +280,6 @@ export default function ProductDetailsPage() {
 
         // Grade (product_variant_sets)
         let sizesFromSets: SizeEntry[] = [];
-        const sizeIdByKeyLocal: Record<SizeKey, string> = {} as any;
         const map: StockMap = {};
         let knownVariants = false;
 
@@ -289,29 +287,27 @@ export default function ProductDetailsPage() {
           const sizeIds = sizeOpts.map((o) => o.id);
           const colorIds = new Set(colorOpts.map((c) => c.id));
 
-          type SetRow = {
-            id: string;
-            amount: number;
-            product_variant_set_options: { variant_option_id: string }[];
-          };
           const { data: sets } = await supabase
             .from("product_variant_sets")
             .select("id, amount, product_variant_set_options(variant_option_id)")
             .eq("product_id", id);
 
           const sumBySize = new Map<string, number>();
+          const setsTyped: PVSetRow[] = (sets ?? []) as PVSetRow[];
 
-          (sets ?? []).forEach((s: any) => {
-            const optIds = (s.product_variant_set_options ?? []).map((o: any) => o.variant_option_id);
-            const sizeId = optIds.find((x: string) => sizeIds.includes(x));
-            const colorId = optIds.find((x: string) => colorIds.has(x));
+          setsTyped.forEach((s) => {
+            const optIds = (s.product_variant_set_options ?? []).map((o) => o.variant_option_id);
+            const sizeId = optIds.find((x) => sizeIds.includes(x));
+            const colorId = optIds.find((x) => colorIds.has(x));
+
+            const amount = Number(s.amount ?? 0);
 
             if (sizeId) {
-              sumBySize.set(sizeId, (sumBySize.get(sizeId) ?? 0) + (s.amount ?? 0));
+              sumBySize.set(sizeId, (sumBySize.get(sizeId) ?? 0) + amount);
             }
             if (sizeId && colorId) {
               const k = `${sizeId}::${colorId}`;
-              map[k] = (map[k] ?? 0) + (s.amount ?? 0);
+              map[k] = (map[k] ?? 0) + amount;
             }
           });
 
@@ -323,18 +319,13 @@ export default function ProductDetailsPage() {
             }))
             .sort((a, b) => SIZE_LABELS.indexOf(a.key) - SIZE_LABELS.indexOf(b.key));
 
-          Object.assign(
-            sizeIdByKeyLocal,
-            Object.fromEntries(sizesFromSets.map((s) => [s.key, s.optionId]))
-          );
-
-          if ((sets ?? []).length > 0) knownVariants = true;
+          if (setsTyped.length > 0) knownVariants = true;
         }
 
         // Fallback: apenas tamanho (product_variants)
         if (sizeGroup && !colorGroup) {
           const sizeIds = sizeOpts.map((o) => o.id);
-          type PV = { variant_option_id: string; amount: number };
+          type PV = { variant_option_id: string; amount: number | null };
           let pvRows: PV[] = [];
           if (sizeIds.length) {
             const { data } = await supabase
@@ -347,15 +338,10 @@ export default function ProductDetailsPage() {
           sizesFromSets = sizeOpts
             .map((o) => {
               const key = o.value as SizeKey;
-              const amt = pvRows.find((r) => r.variant_option_id === o.id)?.amount ?? 0;
+              const amt = Number(pvRows.find((r) => r.variant_option_id === o.id)?.amount ?? 0);
               return { key, optionId: o.id, amount: amt };
             })
             .sort((a, b) => SIZE_LABELS.indexOf(a.key) - SIZE_LABELS.indexOf(b.key));
-
-          Object.assign(
-            sizeIdByKeyLocal,
-            Object.fromEntries(sizesFromSets.map((s) => [s.key, s.optionId]))
-          );
 
           if (pvRows.length > 0) knownVariants = true;
         }
@@ -369,7 +355,7 @@ export default function ProductDetailsPage() {
 
         // Base amount (produto simples)
         const baseIsKnown = prow.amount !== null && prow.amount !== undefined;
-        const baseAmt = baseIsKnown ? (prow.amount as number) : 0;
+        const baseAmt = baseIsKnown ? Number(prow.amount) : 0;
 
         if (!ignore) {
           setProduct(prow);
@@ -379,7 +365,6 @@ export default function ProductDetailsPage() {
           setSizes(sizesFromSets);
           setColors(colorEntries);
           setStockByCombo(map);
-          setSizeIdByKey(Object.keys(sizeIdByKeyLocal).length ? sizeIdByKeyLocal : null);
 
           setVariantsKnown(knownVariants);
           setBaseKnown(baseIsKnown);
@@ -643,7 +628,7 @@ export default function ProductDetailsPage() {
             </DetailsAccordion>
 
             {/* Variantes: Tamanho — sempre clicável se houver ALGUMA cor para aquele tamanho */}
-            {hasSizes && (
+            {sizes.length > 0 && (
               <div>
                 <div className="text-sm font-medium capitalize mb-1">Tamanho</div>
                 <div className="flex flex-wrap gap-2">
@@ -655,8 +640,7 @@ export default function ProductDetailsPage() {
                     const hasGrid = Object.keys(stockByCombo).length > 0;
                     let rowAvailable = entry ? entry.amount : 0;
 
-                    // NOVO: se há grade, o botão de tamanho deve considerar a SOMA da linha,
-                    // e não a combinação com a cor atual (para manter o botão clicável).
+                    // se há grade, botão de tamanho considera a soma da linha
                     if (hasGrid && entry) {
                       let sum = 0;
                       for (const [k, v] of Object.entries(stockByCombo)) {
@@ -696,7 +680,7 @@ export default function ProductDetailsPage() {
             )}
 
             {/* Variantes: Cor — exige tamanho primeiro; nomes quando <= 3 cores */}
-            {hasColors && (
+            {colors.length > 0 && (
               <div>
                 <div className="text-sm font-medium capitalize mb-1">Cor</div>
                 {(() => {
@@ -704,7 +688,7 @@ export default function ProductDetailsPage() {
                   return (
                     <div className="flex flex-wrap gap-2">
                       {colors.map((c) => {
-                        const mustPickSizeFirst = hasSizes && !selectedSizeId;
+                        const mustPickSizeFirst = sizes.length > 0 && !selectedSizeId;
 
                         // disponibilidade via grade quando houver e já tiver tamanho
                         let available = 0;
@@ -778,8 +762,8 @@ export default function ProductDetailsPage() {
                   !product.active ||
                   adding ||
                   isOut ||
-                  (hasSizes && !selectedSizeId) ||
-                  (hasColors && !selectedColorId)
+                  (sizes.length > 0 && !selectedSizeId) ||
+                  (colors.length > 0 && !selectedColorId)
                 }
                 className="flex-1 px-3 py-3 rounded-xl text-white disabled:opacity-50"
                 style={{ backgroundColor: ACCENT }}

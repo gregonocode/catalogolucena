@@ -450,7 +450,7 @@ export default function ProductsPage() {
                 );
               })
             ) : (
-              <span className="text-xs text-gray-500">Nenhuma categoria. Crie em “Categorias”.</span>
+              <span className="text-xs text-gray-500">Nenhuma categoria. Crie em &quot;Categorias&quot;.</span>
             )}
           </div>
         </div>
@@ -485,7 +485,7 @@ export default function ProductsPage() {
             {/* Tamanho */}
             <div className="rounded-xl border border-gray-100 p-3">
               <div className="flex items-center justify-between">
-                <label className="text-sm text-gray-700">Criar grupo "Tamanho"</label>
+                <label className="text-sm text-gray-700">Criar grupo &quot;Tamanho&quot;</label>
                 <button
                   type="button"
                   onClick={toggleCreateSizeGroup}
@@ -529,7 +529,7 @@ export default function ProductsPage() {
             {/* Cor */}
             <div className="rounded-xl border border-gray-100 p-3">
               <div className="flex items-center justify-between">
-                <label className="text-sm text-gray-700">Criar grupo "Cor"</label>
+                <label className="text-sm text-gray-700">Criar grupo &quot;Cor&quot;</label>
                 <button
                   type="button"
                   onClick={toggleCreateColorGroup}

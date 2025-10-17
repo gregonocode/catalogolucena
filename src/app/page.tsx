@@ -119,10 +119,6 @@ export default function Page() {
   const [categories, setCategories] = React.useState<Category[]>([]);
   const [products, setProducts] = React.useState<ProductCard[]>([]);
 
-  // Tamanhos por produto e conhecimento do estoque por variante
-  const [sizesByProduct, setSizesByProduct] = React.useState<Record<string, SizeEntry[]>>({});
-  const [variantKnownByProduct, setVariantKnownByProduct] = React.useState<Record<string, boolean>>({});
-
   // Store settings
   const [storeName, setStoreName] = React.useState<string>("Sua Loja");
   const [whatsE164, setWhatsE164] = React.useState<string | null>(null);
@@ -324,7 +320,7 @@ export default function Page() {
         type SetRow = {
           id: string;
           product_id: string;
-          amount: number;
+          amount: number | null;
           product_variant_set_options: { variant_option_id: string }[];
         };
 
@@ -365,7 +361,7 @@ export default function Page() {
         }
 
         for (const s of allSets) {
-          totalsFromSets[s.product_id] = (totalsFromSets[s.product_id] ?? 0) + (s.amount ?? 0);
+          totalsFromSets[s.product_id] = (totalsFromSets[s.product_id] ?? 0) + Number(s.amount ?? 0);
           const sizeIndex = sizeOptIndexByProduct.get(s.product_id);
           if (!sizeIndex) continue;
 
@@ -376,13 +372,13 @@ export default function Page() {
           const arr = sizesFromSets[s.product_id] ?? [];
           const idx = arr.findIndex((e) => e.optionId === sizeOptId);
           if (idx >= 0) {
-            arr[idx] = { ...arr[idx], amount: arr[idx].amount + (s.amount ?? 0) };
+            arr[idx] = { ...arr[idx], amount: arr[idx].amount + Number(s.amount ?? 0) };
             sizesFromSets[s.product_id] = arr;
           }
         }
 
         // 4) Fallback: product_variants (tamanho-apenas)
-        type PV = { product_id: string; variant_option_id: string; amount: number };
+        type PV = { product_id: string; variant_option_id: string; amount: number | null };
         let pvRows: PV[] = [];
         const productsWithoutSets = productIds.filter((pid) => !(pid in totalsFromSets));
         const sizeOptIds = sizeOpts.map((o) => o.id);
@@ -404,15 +400,14 @@ export default function Page() {
             const arr: SizeEntry[] = pidSizeOpts
               .map((o) => {
                 const amt = pvRows.find((r) => r.product_id === pid && r.variant_option_id === o.id)?.amount ?? 0;
-                return { key: o.value as SizeKey, optionId: o.id, amount: amt };
+                return { key: o.value as SizeKey, optionId: o.id, amount: Number(amt ?? 0) };
               })
               .sort((a, b) => SIZE_LABELS.indexOf(a.key) - SIZE_LABELS.indexOf(b.key));
             sizesFromSets[pid] = arr;
           }
         }
 
-        // 5) Consolidar no estado
-        const sizesMap: Record<string, SizeEntry[]> = {};
+        // 5) Consolidar nos cards (sem estados extras)
         const totals: Record<string, number> = {};
         const knownRecord: Record<string, boolean> = {};
 
@@ -421,17 +416,14 @@ export default function Page() {
           const fromPV = pvRows.some((r) => r.product_id === pid);
 
           knownRecord[pid] = fromSets || fromPV;
-          sizesMap[pid] = sizesFromSets[pid] ?? [];
 
           if (fromSets) {
             totals[pid] = totalsFromSets[pid] ?? 0;
           } else if (fromPV) {
-            totals[pid] = (sizesFromSets[pid] ?? []).reduce((s, e) => s + e.amount, 0);
+            const arr = sizesFromSets[pid] ?? [];
+            totals[pid] = arr.reduce((s, e) => s + e.amount, 0);
           }
         }
-
-        setSizesByProduct(sizesMap);
-        setVariantKnownByProduct(knownRecord);
 
         setProducts((prev) =>
           prev.map((p) => {
@@ -591,7 +583,7 @@ export default function Page() {
 
     // Helpers de busca de opções
     type VOSize = { id: string; value: string; variant_group_id: string };
-    type VOColor = { id: string; value: string; code: string | null; variant_group_id: string };
+    type VariantOptionColorRow = { id: string; value: string; code: string | null; position: number };
 
     const fetchSizeOptions = async (): Promise<VOSize[]> => {
       if (!sizeGroup) return [];
@@ -610,10 +602,11 @@ export default function Page() {
         .select("id, value, code, position")
         .eq("variant_group_id", colorGroup.id)
         .order("position", { ascending: true });
-      return (data ?? []).map((o) => ({
-        id: (o as any).id as string,
-        name: (o as any).value as string,
-        hex: ((o as any).code as string | null) ?? null,
+      const rows = (data ?? []) as VariantOptionColorRow[];
+      return rows.map((o) => ({
+        id: o.id,
+        name: o.value,
+        hex: o.code ?? null,
       }));
     };
 
@@ -624,7 +617,7 @@ export default function Page() {
 
       type SetRow = {
         id: string;
-        amount: number;
+        amount: number | null;
         product_variant_set_options: { variant_option_id: string }[];
       };
       const { data: sets } = await supabase
@@ -645,12 +638,14 @@ export default function Page() {
         const sizeId = optIds.find((id) => sizeIds.includes(id));
         const colorId = optIds.find((id) => colorIds.has(id));
 
+        const amt = Number(s.amount ?? 0);
+
         if (sizeId) {
-          sumBySize.set(sizeId, (sumBySize.get(sizeId) ?? 0) + (s.amount ?? 0));
+          sumBySize.set(sizeId, (sumBySize.get(sizeId) ?? 0) + amt);
         }
         if (sizeId && colorId) {
           const key = `${sizeId}::${colorId}`;
-          stockByCombo[key] = (stockByCombo[key] ?? 0) + (s.amount ?? 0);
+          stockByCombo[key] = (stockByCombo[key] ?? 0) + amt;
         }
       });
 
@@ -688,7 +683,7 @@ export default function Page() {
       const sizeOptions = await fetchSizeOptions();
       const sizeIds = sizeOptions.map((o) => o.id);
 
-      type PV = { variant_option_id: string; amount: number };
+      type PV = { variant_option_id: string; amount: number | null };
       let pvRows: PV[] = [];
       if (sizeIds.length) {
         const { data } = await supabase
@@ -703,7 +698,7 @@ export default function Page() {
         .map((o) => {
           const key = o.value as SizeKey;
           const amt = pvRows.find((r) => r.variant_option_id === o.id)?.amount ?? 0;
-          return { key, optionId: o.id, amount: amt };
+          return { key, optionId: o.id, amount: Number(amt ?? 0) };
         })
         .sort((a, b) => SIZE_LABELS.indexOf(a.key) - SIZE_LABELS.indexOf(b.key));
 
@@ -931,7 +926,6 @@ export default function Page() {
     // ===== VARIANTES: apenas tamanho (product_variants) =====
     if (sizeOnlyItems.length) {
       const variantIds = sizeOnlyItems.map((c) => c.variant_option_id);
-      type FreshPV = { variant_option_id: string; amount: number };
       const { data: fresh, error: freshErr } = await supabase
         .from("product_variants")
         .select("variant_option_id, amount")
@@ -940,7 +934,12 @@ export default function Page() {
         alert("Erro ao validar estoque (tamanhos). Tente novamente.");
         return;
       }
-      const stockMap = new Map<string, number>((fresh ?? []).map((r) => [r.variant_option_id, r.amount]));
+      const stockMap = new Map<string, number>(
+        (fresh ?? []).map((r: { variant_option_id: string; amount: number | null }) => [
+          r.variant_option_id,
+          Number(r.amount ?? 0),
+        ])
+      );
       for (const it of sizeOnlyItems) {
         const available = stockMap.get(it.variant_option_id) ?? 0;
         if (available <= 0) {
@@ -958,11 +957,6 @@ export default function Page() {
     if (sizeColorItems.length) {
       // Buscar todos os SETS dos produtos envolvidos e montar um mapa (sizeId::colorId) -> amount
       const productIds = Array.from(new Set(sizeColorItems.map((i) => i.product_id)));
-      type SetRow = {
-        product_id: string;
-        amount: number;
-        product_variant_set_options: { variant_option_id: string }[];
-      };
       const { data: sets, error: setsErr } = await supabase
         .from("product_variant_sets")
         .select("product_id, amount, product_variant_set_options(variant_option_id)")
@@ -989,7 +983,11 @@ export default function Page() {
 
       // Construir mapa de estoque por combinação
       const comboStock = new Map<string, number>(); // key: `${product_id}:${sizeId}:${colorId}`
-      (sets ?? []).forEach((row: SetRow) => {
+      (sets ?? []).forEach((row: {
+        product_id: string;
+        amount: number | null;
+        product_variant_set_options: { variant_option_id: string }[];
+      }) => {
         const optIds = (row.product_variant_set_options ?? []).map((o) => o.variant_option_id);
         const sizeCandidates = sizeIdsByProduct.get(row.product_id);
         const colorCandidates = colorIdsByProduct.get(row.product_id);
@@ -1000,7 +998,7 @@ export default function Page() {
         if (!sizeId || !colorId) return;
 
         const key = `${row.product_id}:${sizeId}:${colorId}`;
-        comboStock.set(key, (comboStock.get(key) ?? 0) + (row.amount ?? 0));
+        comboStock.set(key, (comboStock.get(key) ?? 0) + Number(row.amount ?? 0));
       });
 
       // Validar cada item do carrinho
@@ -1026,7 +1024,6 @@ export default function Page() {
     // ===== SIMPLES =====
     if (noVariant.length) {
       const prodIds = noVariant.map((c) => c.product_id);
-      type FreshProd = { id: string; amount: number | null };
       const { data: freshP, error: freshPErr } = await supabase
         .from("products")
         .select("id, amount")
@@ -1035,7 +1032,9 @@ export default function Page() {
         alert("Erro ao validar estoque. Tente novamente.");
         return;
       }
-      const stockMap = new Map<string, number | null>((freshP ?? []).map((r) => [r.id, r.amount]));
+      const stockMap = new Map<string, number | null>(
+        (freshP ?? []).map((r: { id: string; amount: number | null }) => [r.id, r.amount])
+      );
       for (const it of noVariant) {
         const available = stockMap.get(it.product_id);
         if (available === null || (available ?? 0) <= 0) {
@@ -1449,57 +1448,57 @@ export default function Page() {
             )}
 
             {/* Cor (apenas no modo size-color) */}
-{quickAdd.mode === "size-color" && quickAdd.colors.length > 0 && (
-  <div className="mt-3">
-    <div className="text-sm font-medium mb-1">Cor</div>
+            {quickAdd.mode === "size-color" && quickAdd.colors.length > 0 && (
+              <div className="mt-3">
+                <div className="text-sm font-medium mb-1">Cor</div>
 
-    {(() => {
-      // se houver 3 ou mais cores, NÃO mostrar os nomes (só as bolinhas)
-      const showColorNames = quickAdd.colors.length <= 3;
+                {(() => {
+                  // se houver 3 ou mais cores, NÃO mostrar os nomes (só as bolinhas)
+                  const showColorNames = quickAdd.colors.length <= 3;
 
-      return (
-        <div className="flex flex-wrap gap-2">
-          {quickAdd.colors.map((c) => {
-            const active = qaSelectedColor === c.id;
+                  return (
+                    <div className="flex flex-wrap gap-2">
+                      {quickAdd.colors.map((c) => {
+                        const active = qaSelectedColor === c.id;
 
-            // desabilita enquanto não há tamanho
-            let disabled = !qaSelectedSize;
+                        // desabilita enquanto não há tamanho
+                        let disabled = !qaSelectedSize;
 
-            // se já há tamanho, desabilita quando a combinação não tem estoque
-            if (!disabled && qaSelectedSize && quickAdd.sizeIdByKey) {
-              const sizeId = quickAdd.sizeIdByKey[qaSelectedSize];
-              if (sizeId) {
-                disabled = comboQty(sizeId, c.id) <= 0;
-              }
-            }
+                        // se já há tamanho, desabilita quando a combinação não tem estoque
+                        if (!disabled && qaSelectedSize && quickAdd.sizeIdByKey) {
+                          const sizeId = quickAdd.sizeIdByKey[qaSelectedSize];
+                          if (sizeId) {
+                            disabled = comboQty(sizeId, c.id) <= 0;
+                          }
+                        }
 
-            return (
-              <button
-                key={c.id}
-                type="button"
-                disabled={disabled}
-                onClick={() => handleSelectColor(c.id)}
-                aria-label={c.name}
-                title={c.name}
-                className={`px-2.5 py-1.5 rounded-full border text-sm flex items-center
+                        return (
+                          <button
+                            key={c.id}
+                            type="button"
+                            disabled={disabled}
+                            onClick={() => handleSelectColor(c.id)}
+                            aria-label={c.name}
+                            title={c.name}
+                            className={`px-2.5 py-1.5 rounded-full border text-sm flex items-center
                   ${showColorNames ? "gap-2" : "gap-0"}
                   ${active ? "text-white border-transparent" : "text-gray-700 border-gray-200 bg-gray-50"}
                   disabled:opacity-40 disabled:cursor-not-allowed`}
-                style={active ? { backgroundColor: ACCENT } : {}}
-              >
-                <span
-                  className="inline-block w-4 h-4 rounded-full border"
-                  style={{ backgroundColor: c.hex ?? "#fff", borderColor: "#e5e7eb" }}
-                />
-                {showColorNames && <span className="whitespace-nowrap">{c.name}</span>}
-              </button>
-            );
-          })}
-        </div>
-      );
-    })()}
-  </div>
-)}
+                            style={active ? { backgroundColor: ACCENT } : {}}
+                          >
+                            <span
+                              className="inline-block w-4 h-4 rounded-full border"
+                              style={{ backgroundColor: c.hex ?? "#fff", borderColor: "#e5e7eb" }}
+                            />
+                            {showColorNames && <span className="whitespace-nowrap">{c.name}</span>}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  );
+                })()}
+              </div>
+            )}
 
             {/* Quantidade + CTA */}
             <div className="mt-3 flex items-center justify-between">

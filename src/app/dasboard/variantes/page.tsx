@@ -27,6 +27,7 @@ type Product = { id: string; title: string };
 type VariantGroup = { id: string; product_id: string; name: string; position: number };
 type VariantGroupEditable = VariantGroup & { _editing?: boolean };
 type VariantOption = { id: string; variant_group_id: string; value: string; code: string | null; position: number };
+type PVRow = { variant_option_id: string; amount: number | null };
 
 type SizeKey = "P" | "M" | "G" | "GG";
 const SIZE_LABELS: SizeKey[] = ["P", "M", "G", "GG"];
@@ -119,63 +120,147 @@ export default function VariantsPage() {
   const bumpMatrix = React.useCallback(() => setMatrixRefresh((v) => v + 1), []);
 
   // ---------------- Helpers base (carregar dados) ----------------
-  async function reloadFor(
-    pid: string,
-    sb = supabase,
-    setG: React.Dispatch<React.SetStateAction<VariantGroupEditable[]>> = setGroups,
-    setO: React.Dispatch<React.SetStateAction<VariantOption[]>> = setOptions,
-    setL: React.Dispatch<React.SetStateAction<boolean>> = setLoadingData,
-    setE: React.Dispatch<React.SetStateAction<string | null>> = setErr
-  ): Promise<{ groups: VariantGroupEditable[]; options: VariantOption[] }> {
-    if (!pid) {
-      setG([]);
-      setO([]);
-      return { groups: [], options: [] };
-    }
-    setL(true);
-    setE(null);
+  const reloadFor = React.useCallback(
+    async (
+      pid: string,
+      sb = supabase,
+      setG: React.Dispatch<React.SetStateAction<VariantGroupEditable[]>> = setGroups,
+      setO: React.Dispatch<React.SetStateAction<VariantOption[]>> = setOptions,
+      setL: React.Dispatch<React.SetStateAction<boolean>> = setLoadingData,
+      setE: React.Dispatch<React.SetStateAction<string | null>> = setErr
+    ): Promise<{ groups: VariantGroupEditable[]; options: VariantOption[] }> => {
+      if (!pid) {
+        setG([]);
+        setO([]);
+        return { groups: [], options: [] };
+      }
+      setL(true);
+      setE(null);
 
-    const { data: gdata, error: gerr } = await sb
-      .from("variant_groups")
-      .select("id, product_id, name, position")
-      .eq("product_id", pid)
-      .order("position", { ascending: true })
-      .order("id", { ascending: true });
-
-    if (gerr) {
-      setE(gerr.message);
-      setL(false);
-      return { groups: [], options: [] };
-    }
-
-    const groupIds = (gdata ?? []).map((g) => g.id);
-
-    let odata: VariantOption[] = [];
-    if (groupIds.length) {
-      const { data: o, error: oerr } = await sb
-        .from("variant_options")
-        .select("id, variant_group_id, value, code, position")
-        .in("variant_group_id", groupIds)
+      const { data: gdata, error: gerr } = await sb
+        .from("variant_groups")
+        .select("id, product_id, name, position")
+        .eq("product_id", pid)
         .order("position", { ascending: true })
         .order("id", { ascending: true });
-      if (oerr) {
-        setE(oerr.message);
+
+      if (gerr) {
+        setE(gerr.message);
         setL(false);
-        return { groups: (gdata ?? []) as VariantGroupEditable[], options: [] };
+        return { groups: [], options: [] };
       }
-      odata = (o ?? []) as VariantOption[];
-    }
 
-    const gArr = (gdata ?? []) as VariantGroupEditable[];
-    const oArr = odata;
+      const groupIds = (gdata ?? []).map((g) => g.id);
 
-    setG(gArr);
-    setO(oArr);
-    setL(false);
+      let odata: VariantOption[] = [];
+      if (groupIds.length) {
+        const { data: o, error: oerr } = await sb
+          .from("variant_options")
+          .select("id, variant_group_id, value, code, position")
+          .in("variant_group_id", groupIds)
+          .order("position", { ascending: true })
+          .order("id", { ascending: true });
+        if (oerr) {
+          setE(oerr.message);
+          setL(false);
+          return { groups: (gdata ?? []) as VariantGroupEditable[], options: [] };
+        }
+        odata = (o ?? []) as VariantOption[];
+      }
 
-    return { groups: gArr, options: oArr };
+      const gArr = (gdata ?? []) as VariantGroupEditable[];
+      const oArr = odata;
+
+      setG(gArr);
+      setO(oArr);
+      setL(false);
+
+      return { groups: gArr, options: oArr };
+    },
+    [supabase]
+  );
+
+  function resetSizesUI() {
+    setSizeGroupId(null);
+    setSizeOptionIds({ P: null, M: null, G: null, GG: null });
+    setSizesSelected({ P: false, M: false, G: false, GG: false });
+    setSizesAmount({ P: 0, M: 0, G: 0, GG: 0 });
+    setEditing({ P: false, M: false, G: false, GG: false });
+    setSavingOne(null);
   }
 
+  const productGroups = React.useMemo(
+    () => groups.filter((g) => g.product_id === productId).sort((a, b) => a.position - b.position),
+    [groups, productId]
+  );
+
+  const loadSizeStockForProduct = React.useCallback(
+    async (
+      pid: string,
+      groupsArg?: VariantGroupEditable[],
+      optionsArg?: VariantOption[]
+    ) => {
+      resetSizesUI();
+      if (!pid) return;
+
+      setLoadingSizes(true);
+      setErr(null);
+
+      try {
+        const gList = groupsArg ?? productGroups;
+        const oList = optionsArg ?? options;
+
+        const sizeGroup = gList.find((g) => isSizeName(g.name)) ?? null;
+        setSizeGroupId(sizeGroup?.id ?? null);
+
+        const idMap: Record<SizeKey, string | null> = { P: null, M: null, G: null, GG: null };
+        if (sizeGroup) {
+          const szOpts = oList
+            .filter((o) => o.variant_group_id === sizeGroup.id)
+            .filter((o) => SIZE_LABELS.includes(o.value as SizeKey));
+          for (const key of SIZE_LABELS) {
+            const opt = szOpts.find((o) => o.value === key);
+            idMap[key] = opt?.id ?? null;
+          }
+        }
+        setSizeOptionIds(idMap);
+
+        const idsToLoad = Object.values(idMap).filter(Boolean) as string[];
+
+        let pvArr: PVRow[] = [];
+        if (idsToLoad.length) {
+          const { data: pvRows } = await supabase
+            .from("product_variants")
+            .select("variant_option_id, amount")
+            .eq("product_id", pid)
+            .in("variant_option_id", idsToLoad);
+          pvArr = (pvRows ?? []) as PVRow[];
+        }
+
+        const amt: Record<SizeKey, number> = { P: 0, M: 0, G: 0, GG: 0 };
+        const sel: Record<SizeKey, boolean> = { P: false, M: false, G: false, GG: false };
+        for (const key of SIZE_LABELS) {
+          const vid = idMap[key];
+          if (vid) {
+            sel[key] = true;
+            const found = pvArr.find((r) => r.variant_option_id === vid);
+            const foundAmount = Number(found?.amount ?? 0);
+            amt[key] = Number.isFinite(foundAmount) ? foundAmount : 0;
+          }
+        }
+        setSizesAmount(amt);
+        setSizesSelected(sel);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : "Erro ao carregar tamanhos";
+        setErr(msg);
+      } finally {
+        setLoadingSizes(false);
+      }
+    },
+    [supabase, productGroups, options]
+  );
+
+  // Carregar lista de produtos + primeiro produto
   React.useEffect(() => {
     let ignore = false;
     (async () => {
@@ -204,8 +289,9 @@ export default function VariantsPage() {
     return () => {
       ignore = true;
     };
-  }, [supabase]);
+  }, [supabase, reloadFor, loadSizeStockForProduct]);
 
+  // Recarregar grupos/opções ao trocar de produto
   React.useEffect(() => {
     if (productId) {
       (async () => {
@@ -219,13 +305,7 @@ export default function VariantsPage() {
       setOptions([]);
       resetSizesUI();
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [productId]);
-
-  const productGroups = React.useMemo(
-    () => groups.filter((g) => g.product_id === productId).sort((a, b) => a.position - b.position),
-    [groups, productId]
-  );
+  }, [productId, reloadFor, loadSizeStockForProduct, bumpMatrix]);
 
   // Se existir grupo "Cor", vamos esconder o editor de Qtd do grupo Tamanho
   const hasColorGroup = React.useMemo(
@@ -237,78 +317,7 @@ export default function VariantsPage() {
     return productGroups.length ? Math.max(...productGroups.map((g) => g.position)) + 1 : 0;
   }
 
-  // ---------------- Tamanhos: carregar/garantir (modo antigo) ----------------
-  function resetSizesUI() {
-    setSizeGroupId(null);
-    setSizeOptionIds({ P: null, M: null, G: null, GG: null });
-    setSizesSelected({ P: false, M: false, G: false, GG: false });
-    setSizesAmount({ P: 0, M: 0, G: 0, GG: 0 });
-    setEditing({ P: false, M: false, G: false, GG: false });
-    setSavingOne(null);
-  }
-
-  async function loadSizeStockForProduct(
-    pid: string,
-    groupsArg?: VariantGroupEditable[],
-    optionsArg?: VariantOption[]
-  ) {
-    resetSizesUI();
-    if (!pid) return;
-
-    setLoadingSizes(true);
-    setErr(null);
-
-    try {
-      const gList = groupsArg ?? productGroups;
-      const oList = optionsArg ?? options;
-
-      const sizeGroup = gList.find((g) => isSizeName(g.name)) ?? null;
-      setSizeGroupId(sizeGroup?.id ?? null);
-
-      const idMap: Record<SizeKey, string | null> = { P: null, M: null, G: null, GG: null };
-      if (sizeGroup) {
-        const szOpts = oList
-          .filter((o) => o.variant_group_id === sizeGroup.id)
-          .filter((o) => SIZE_LABELS.includes(o.value as SizeKey));
-        for (const key of SIZE_LABELS) {
-          const opt = szOpts.find((o) => o.value === key);
-          idMap[key] = opt?.id ?? null;
-        }
-      }
-      setSizeOptionIds(idMap);
-
-      const idsToLoad = Object.values(idMap).filter(Boolean) as string[];
-
-      let pvArr: { variant_option_id: string; amount: number }[] = [];
-      if (idsToLoad.length) {
-        const { data: pvRows } = await supabase
-          .from("product_variants")
-          .select("variant_option_id, amount")
-          .eq("product_id", pid)
-          .in("variant_option_id", idsToLoad);
-        pvArr = (pvRows ?? []) as { variant_option_id: string; amount: number }[];
-      }
-
-      const amt: Record<SizeKey, number> = { P: 0, M: 0, G: 0, GG: 0 };
-      const sel: Record<SizeKey, boolean> = { P: false, M: false, G: false, GG: false };
-      for (const key of SIZE_LABELS) {
-        const vid = idMap[key];
-        if (vid) {
-          sel[key] = true;
-          const found = pvArr.find((r) => r.variant_option_id === vid);
-          amt[key] = Number.isFinite(found?.amount as number) ? (found!.amount as number) : 0;
-        }
-      }
-      setSizesAmount(amt);
-      setSizesSelected(sel);
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : "Erro ao carregar tamanhos";
-      setErr(msg);
-    } finally {
-      setLoadingSizes(false);
-    }
-  }
-
+  // ---------------- Tamanhos: ensure/toggle/save ----------------
   async function ensureSizeGroup(): Promise<string> {
     const existing = productGroups.find((g) => isSizeName(g.name));
     if (existing) return existing.id;
@@ -390,7 +399,6 @@ export default function VariantsPage() {
         setOk(`Tamanho ${size} removido.`);
       }
 
-      // se já existir Cor, a Grade depende disso → atualiza
       if (hasColorGroup) bumpMatrix();
     } catch (e) {
       setErr(e instanceof Error ? e.message : "Erro ao alternar tamanho");
@@ -428,7 +436,6 @@ export default function VariantsPage() {
   }
 
   // ---------------- COR: ativar grupo + migração opcional ----------------
-
   async function ensureColorGroup(): Promise<string> {
     const existing = productGroups.find((g) => isColorName(g.name));
     if (existing) return existing.id;
@@ -441,7 +448,11 @@ export default function VariantsPage() {
     if (error) throw error;
 
     const fresh = await reloadFor(productId);
-    return data.id || fresh.groups.find((g) => isColorName(g.name))?.id!;
+    const found = fresh.groups.find((g) => isColorName(g.name));
+    if (data?.id) return data.id;
+    if (found?.id) return found.id;
+
+    throw new Error("Falha ao obter ID do grupo de Cor.");
   }
 
   async function createColorOption(colorGroupId: string, name: string, hex: string) {
@@ -477,7 +488,8 @@ export default function VariantsPage() {
     if (pvErr) throw pvErr;
 
     const byOption = new Map<string, number>();
-    (pvRows ?? []).forEach((r: any) => {
+    const rowsTyped: PVRow[] = (pvRows ?? []) as PVRow[];
+    rowsTyped.forEach((r) => {
       byOption.set(r.variant_option_id, Number(r.amount ?? 0));
     });
 
